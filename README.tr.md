@@ -28,7 +28,9 @@ Tanıtım görseli, güncel arayüz ve kurgu hesap/mesaj örnekleri referans al�
 - Nostaljik yerel durumlar; açık onayla Telegram adının sonuna görünür bir etiket ekleyerek isteğe bağlı durum paylaşımı.
 - Yerel, statik ICQ Now! müze sayfası.
 
-**Mevcut sınırlar:** QR girişi, yeni hesap oluşturma ve ek e-posta kurulum akışları tamamlanmadı. Giriş uç durumları, yeniden bağlanma ve güvenlik özellikleri daha kapsamlı bağımsız test gerektiriyor. Yerelde kullanılan özgün ses kayıtları açık depoda bulunmuyor. Genel kullanıcı dağıtımı öncesinde kanal sponsorlu mesaj desteği ve diğer Telegram API koşulları ayrıca gözden geçirilmeli. [Geliştirme](docs/DEVELOPMENT.md), [güvenlik](docs/SECURITY.md) ve [lisans](docs/LICENSING.md) notlarına bakın.
+**Mevcut sınırlar:** Retro arayüz upstream istemcinin yalnız bir bölümünü kullanıma sunuyor. Mesaj yanıtlama/düzenleme/silme/iletme/arama, bot klavyeleri, zengin mesaj çizimi, fotoğraf/video olarak gönderme ve bazı hesap/grup işlemleri henüz bağlı değil. QR girişi, yeni hesap oluşturma ve ek e-posta kurulumu da tamamlanmadı. Eski geçmişin güncellenmesi, yeniden başlatma sonrası belirsiz gönderimler, pencere kaynak sınırları, yeniden bağlanma ve güvenlik sınırları geliştirme veya doğrulama gerektiriyor. Arayüzde İngilizce/Türkçe karışımı sürüyor. Orijinal ses kayıtları, imzalı kurulum paketi ve IBQgram güncelleme mekanizması bulunmuyor. Genel kullanıcı dağıtımı öncesinde sponsorlu içerik ve diğer Telegram API gereklilikleri tamamlanmalı/değerlendirilmeli.
+
+Kesin eksikleri, kısmi özellikleri, doğrulama işlerini ve isteğe bağlı sonraki kapsamı [önceliklendirilmiş tam yapılacaklar listesinde](TODO.md) bulabilirsiniz. Her maddede mevcut davranış ve tamamlanma ölçütü var. Ek bağlam: [geliştirme](docs/DEVELOPMENT.md), [güvenlik](docs/SECURITY.md), [lisans](docs/LICENSING.md). GitHub Actions kapalı kalıyor.
 
 ## Ortak arayüzü deneyin
 

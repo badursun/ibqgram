@@ -28,7 +28,9 @@ The promotional image was generated with ImageGen using the current UI and ficti
 - Nostalgic local statuses; optional status sharing through a visible Telegram name suffix, with explicit opt-in.
 - A local, static ICQ Now! museum page.
 
-**Current limits:** QR login, new-account registration and additional email setup flows are not implemented. Authentication edge cases, reconnect behavior and security properties still need broader independent testing. The public source does not include the locally supplied original sound recordings. Channel sponsored-message support and other Telegram API requirements require a release review before a general end-user launch. See [development](docs/DEVELOPMENT.md), [security](docs/SECURITY.md) and [licensing](docs/LICENSING.md).
+**Current limits:** The retro interface exposes a subset of the upstream client. Message reply/edit/delete/forward/search, bot keyboards, rich message rendering, media-as-photo/video sending and several account/group controls are not connected yet. QR login, new-account registration and additional email setup flows are also incomplete. Older-history reconciliation, uncertain sends across restarts, window resource limits, reconnect behavior and security boundaries need further work or validation. The UI still mixes English and Turkish. Original sound recordings are not included, and no signed installer or IBQgram update mechanism is supplied. Sponsored content and other Telegram API requirements need implementation/review before a general end-user launch.
+
+See the [complete prioritized checklist (Türkçe)](TODO.md) for confirmed gaps, partial implementations, validation tasks and optional future scope. Each item includes its current behavior and completion criteria. [Development](docs/DEVELOPMENT.md), [security](docs/SECURITY.md) and [licensing](docs/LICENSING.md) provide additional context. GitHub Actions remains disabled.
 
 ## Try the shared UI
 
