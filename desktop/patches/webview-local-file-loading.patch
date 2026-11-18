@@ -1,0 +1,79 @@
+diff --git a/webview/platform/mac/webview_mac.mm b/webview/platform/mac/webview_mac.mm
+index c7db4e3..e090585 100644
+--- a/webview/platform/mac/webview_mac.mm
++++ b/webview/platform/mac/webview_mac.mm
+@@ -1383,7 +1383,11 @@ void finishRestrictedRules(
+ void Instance::navigateNow(const std::string &url) {
+ 	NSString *string = [NSString stringWithUTF8String:url.c_str()];
+ 	NSURL *native = [NSURL URLWithString:string];
+-	[_webview loadRequest:[NSURLRequest requestWithURL:native]];
++	if (native.isFileURL) {
++		[_webview loadFileURL:native allowingReadAccessToURL:[native URLByDeletingLastPathComponent]];
++	} else {
++		[_webview loadRequest:[NSURLRequest requestWithURL:native]];
++	}
+ }
+ 
+ void Instance::navigate(std::string url) {
+diff --git a/webview/webview_embed.cpp b/webview/webview_embed.cpp
+index a141f24..9f8b2bb 100644
+--- a/webview/webview_embed.cpp
++++ b/webview/webview_embed.cpp
+@@ -17,6 +17,7 @@
+ #include "webview/webview_interface.h"
+ 
+ #include <QtCore/QJsonArray>
++#include <QtCore/QFileInfo>
+ #include <QtCore/QJsonDocument>
+ #include <QtCore/QTemporaryDir>
+ #include <QtCore/QUrl>
+@@ -142,6 +143,9 @@ bool Window::valid() const {
+ 
+ bool Window::createWebView(QWidget *parent, const WindowConfig &config) {
+ 	Expects(!_webview);
++	if (!config.localContentDirectory.isEmpty()) {
++		_localContentDirectory = QFileInfo(config.localContentDirectory).canonicalFilePath();
++	}
+ 	const auto restricted = !config.restrictedOrigin.isEmpty();
+ 	const auto restrictedContent = restricted
+ 		? MakeRestrictedContent(config.restrictedOrigin)
+@@ -443,10 +447,18 @@ void Window::setDataRequestHandler(Fn<DataResult(DataRequest)> handler) {
+ Fn<bool(std::string,bool)> Window::navigationPolicyHandler() const {
+ 	return [=](std::string message, bool newWindow) {
+ 		const auto lower = QString::fromStdString(message).toLower();
++		const auto url = QUrl::fromEncoded(QByteArray::fromStdString(message));
++		const auto localAllowed = !newWindow
++			&& !_localContentDirectory.isEmpty()
++			&& bool(_navigationPolicyHandler)
++			&& url.isLocalFile()
++			&& QFileInfo(url.toLocalFile()).canonicalFilePath().startsWith(
++				_localContentDirectory + '/');
+ 		if (!lower.startsWith(u"http://"_q)
+ 			&& !lower.startsWith(u"https://"_q)
+ 			&& !lower.startsWith(u"tonsite://"_q)
+-			&& !lower.startsWith(u"ton://"_q)) {
++			&& !lower.startsWith(u"ton://"_q)
++			&& !localAllowed) {
+ 			return false;
+ 		}
+ 		auto result = true;
+diff --git a/webview/webview_embed.h b/webview/webview_embed.h
+index d179b2f..514c9c0 100644
+--- a/webview/webview_embed.h
++++ b/webview/webview_embed.h
+@@ -51,6 +51,7 @@ struct WindowConfig {
+ 	QSize initialSize;
+ 	QString shellMessageToken;
+ 	QString restrictedOrigin;
++	QString localContentDirectory;
+ };
+ 
+ class Window final {
+@@ -122,6 +123,7 @@ private:
+ 
+ 	std::unique_ptr<QTemporaryDir> _temporaryStorage;
+ 	std::unique_ptr<Interface> _webview;
++	QString _localContentDirectory;
+ 	Fn<void(Message)> _messageHandler;
+ 	Fn<bool(std::string,bool)> _navigationPolicyHandler;
+ 	Fn<void()> _navigationStartHandler;

@@ -1,0 +1,27 @@
+{
+  "name": "ibqgram",
+  "version": "0.1.0-alpha.1",
+  "private": true,
+  "description": "A nostalgic desktop messenger built on Telegram Desktop.",
+  "license": "GPL-3.0-only",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "node scripts/serve.mjs",
+    "check": "node --check prototype/bot-commands.js && node --check prototype/notifications.js && node --check prototype/app.js && node --check prototype/audio.js && node --check prototype/boot.js && node --check prototype/brand.js && node --check scripts/serve.mjs && node --check prototype/bridge.js && node --check prototype/native.js && node --check prototype/presence.js && node --check prototype/account.js && node --check prototype/chat.js && node --check prototype/chat-model.js && node --check prototype/directory.js",
+    "test": "node --test scripts/*.test.mjs",
+    "doctor": "python3 scripts/doctor.py",
+    "desktop:build": "python3 scripts/build-native.py",
+    "desktop:open": "open 'desktop/tdesktop/out/Debug/icqram.app'",
+    "ui:build": "bash scripts/build-preview.sh",
+    "ui:open": "open 'build/icqram.app'",
+    "ui:package": "node scripts/package-ui.mjs",
+    "ui:verify": "node scripts/verify-ui.mjs",
+    "native:configure": "python3 scripts/configure-native.py",
+    "native:build": "python3 scripts/build-native.py",
+    "security:verify": "python3 scripts/security-check.py",
+    "source:prepare": "python3 scripts/prepare-source.py"
+  }
+}

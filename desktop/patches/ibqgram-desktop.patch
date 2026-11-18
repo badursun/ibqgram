@@ -1,0 +1,3458 @@
+diff --git a/Telegram/CMakeLists.txt b/Telegram/CMakeLists.txt
+index 1601b50812..eb9ea7de7d 100644
+--- a/Telegram/CMakeLists.txt
++++ b/Telegram/CMakeLists.txt
+@@ -25,6 +25,7 @@ get_filename_component(src_loc SourceFiles REALPATH)
+ get_filename_component(res_loc Resources REALPATH)
+ 
+ include(cmake/telegram_options.cmake)
++include(cmake/icqram.cmake)
+ include(cmake/lib_ffmpeg.cmake)
+ include(cmake/lib_stripe.cmake)
+ include(cmake/lib_tgcalls.cmake)
+@@ -2855,12 +2856,12 @@ if (build_macstore)
+     )
+ else()
+     if (CMAKE_GENERATOR STREQUAL Xcode)
+-        set(bundle_identifier "com.tdesktop.Telegram$<$<CONFIG:Debug>:Debug>")
++        set(bundle_identifier "app.icqram.desktop$<$<CONFIG:Debug>:.debug>")
+     else()
+-        set(bundle_identifier "com.tdesktop.Telegram")
++        set(bundle_identifier "app.icqram.desktop")
+     endif()
+     set(bundle_entitlements "Telegram.entitlements")
+-    set(output_name "Telegram")
++    set(output_name "icqram")
+ endif()
+ 
+ if (CMAKE_GENERATOR STREQUAL Xcode)
+@@ -2886,6 +2887,10 @@ set_target_properties(Telegram PROPERTIES
+     XCODE_ATTRIBUTE_OTHER_CODE_SIGN_FLAGS --deep
+     XCODE_ATTRIBUTE_CLANG_DEBUG_INFORMATION_LEVEL $<IF:$<CONFIG:Debug>,default,line-tables-only>
+ )
++if (ICQRAM_SHELL)
++    set_target_properties(Telegram PROPERTIES XCODE_ATTRIBUTE_ASSETCATALOG_COMPILER_APPICON_NAME "")
++endif()
++
+ set(entitlement_sources
+     "${CMAKE_CURRENT_SOURCE_DIR}/Telegram/Telegram.entitlements"
+     "${CMAKE_CURRENT_SOURCE_DIR}/Telegram/Telegram Lite.entitlements"
+diff --git a/Telegram/SourceFiles/api/api_icqram_account.cpp b/Telegram/SourceFiles/api/api_icqram_account.cpp
+new file mode 100644
+index 0000000000..a86e48c284
+--- /dev/null
++++ b/Telegram/SourceFiles/api/api_icqram_account.cpp
+@@ -0,0 +1,431 @@
++#include "api/api_icqram_account.h"
++#include "apiwrap.h"
++
++#include "main/main_account.h"
++#include "main/main_session.h"
++#include "data/data_session.h"
++#include "data/data_histories.h"
++#include "data/data_user.h"
++#include "data/data_chat.h"
++#include "data/data_channel.h"
++#include "data/data_folder.h"
++#include "data/data_types.h"
++#include <QtCore/QJsonArray>
++#include <QtCore/QBuffer>
++#include <QtCore/QDateTime>
++#include <QtCore/QRegularExpression>
++#include <QtCore/QSet>
++#include <QtCore/QSettings>
++#include "history/history.h"
++#include "history/view/history_view_send_action.h"
++
++namespace Api {
++PeerId IcqramPeerId(const QString &key) {
++	static const auto pattern = QRegularExpression(u"^(?:(chat|channel):)?([1-9][0-9]{0,15})$"_q);
++	const auto match = pattern.match(key);
++	if (!match.hasMatch()) return PeerId();
++	const auto id = match.captured(2).toULongLong();
++	return match.captured(1) == u"chat"_q ? peerFromChat(ChatId(id))
++		: match.captured(1) == u"channel"_q ? peerFromChannel(ChannelId(id))
++		: peerFromUser(UserId(id));
++}
++QString IcqramPeerKey(PeerId id) {
++	return peerIsChat(id) ? u"chat:"_q + QString::number(peerToChat(id).bare)
++		: peerIsChannel(id) ? u"channel:"_q + QString::number(peerToChannel(id).bare)
++		: QString::number(peerToUser(id).bare);
++}
++namespace {
++QString PinnedKey(quint64 ownId) { return u"accounts/"_q + QString::number(ownId) + u"/listedBots"_q; }
++QStringList PinnedBots(quint64 ownId) { return QSettings(u"icqram"_q, u"icqram"_q).value(PinnedKey(ownId)).toStringList(); }
++QString ErrorCode(const MTP::Error &error) {
++	return MTP::IsFloodError(error) ? u"FLOOD_WAIT"_q : u"ACCOUNT_UNAVAILABLE"_q;
++}
++const QRegularExpression &StatusSuffix() {
++	static const auto result = QRegularExpression(u"(?:^|\\s)\\[ST:(AV|FC|AW|NA|OC|DND|IV|OF|PH|LC)\\]$"_q);
++	return result;
++}
++QJsonObject DirectoryUser(not_null<UserData*> user) {
++	const auto entry = QString::number(peerToUser(user->id).bare) + ':' + user->username();
++	return {
++		{u"listed"_q, PinnedBots(user->session().userId().bare).contains(entry)},
++		{u"id"_q, QString::number(peerToUser(user->id).bare)},
++		{u"name"_q, user->name()}, {u"username"_q, user->username()},
++		{u"firstName"_q, user->firstName}, {u"lastName"_q, user->lastName},
++		{u"contact"_q, user->isContact()}, {u"bot"_q, user->isBot()},
++		{u"verified"_q, user->isVerified()}, {u"self"_q, user->isSelf()},
++		{u"online"_q, user->lastseen().isOnline(QDateTime::currentSecsSinceEpoch())}
++	};
++}
++}
++IcqramAccount::IcqramAccount(not_null<Main::Account*> account, Fn<bool()> allowed)
++: _account(account), _allowed(std::move(allowed)), _api(&account->mtp()) {
++	_dialogsDeadline.setCallback([=] {
++		_api.request(base::take(_dialogsRequest)).cancel();
++		if (auto reply = base::take(_dialogsReply)) reply({}, u"TIMEOUT"_q);
++	});
++	_directoryDeadline.setCallback([=] {
++		_api.request(base::take(_directoryRequest)).cancel();
++		finishDirectory({}, _directoryAdding ? u"ADD_UNCERTAIN"_q : u"TIMEOUT"_q);
++	});
++	_contactsDeadline.setCallback([=] {
++		_api.request(base::take(_contactsRequest)).cancel();
++		if (auto reply = base::take(_contactsReply)) reply({}, u"TIMEOUT"_q);
++	});
++	_profileDeadline.setCallback([=] {
++		_api.request(base::take(_profileRequest)).cancel();
++		if (auto reply = base::take(_profileReply)) reply({}, u"TIMEOUT"_q);
++	});
++	_presenceDeadline.setCallback([=] {
++		_api.request(base::take(_presenceRequest)).cancel();
++		finishPresence({}, u"PRESENCE_UNCERTAIN"_q);
++	});
++}
++QString IcqramAccount::profileAvatar() const {
++	const auto session = _account->maybeSession();
++	if (!session) return {};
++	const auto user = session->user();
++	if (!user->hasUserpic()) return {};
++	if (_profileUserpic.null()) _profileUserpic = user->createUserpicView();
++	user->loadUserpic();
++	if (user->useEmptyUserpic(_profileUserpic)) return {};
++	auto bytes = QByteArray();
++	auto buffer = QBuffer(&bytes);
++	if (!buffer.open(QIODevice::WriteOnly)) return {};
++	const auto avatar = PeerData::GenerateUserpicImage(user, _profileUserpic, 96, 0);
++	if (!avatar.save(&buffer, "PNG") || bytes.size() > 65000) return {};
++	return u"data:image/png;base64,"_q + QString::fromLatin1(bytes.toBase64());
++}
++QJsonObject IcqramAccount::profile() const {
++	const auto session = _account->maybeSession();
++	if (!session) return {};
++	const auto user = session->user();
++	return {
++		{u"uin"_q, QString::number(session->userId().bare)},
++		{u"firstName"_q, user->firstName}, {u"lastName"_q, user->lastName},
++		{u"name"_q, (user->firstName + ' ' + user->lastName).trimmed()},
++		{u"username"_q, user->username()},
++		{u"avatar"_q, profileAvatar()},
++        {u"shareStatus"_q, QSettings(u"icqram"_q,u"icqram"_q).value(u"accounts/"_q + QString::number(session->userId().bare) + u"/shareStatus"_q,false).toBool()},
++        {u"localPresence"_q, QSettings(u"icqram"_q,u"icqram"_q).value(u"accounts/"_q + QString::number(session->userId().bare) + u"/presence"_q).toString()}
++	};
++}
++void IcqramAccount::request(const QString &method, const QJsonObject &params, Reply reply) {
++	if (!_allowed()) return reply({}, u"LOCKED"_q);
++	if (method == u"profile.load"_q) loadProfile(std::move(reply));
++	else if (method == u"contacts.load"_q) loadContacts(std::move(reply));
++	else if (method == u"dialogs.load"_q) loadDialogs(params.value(u"reset"_q).toBool(), std::move(reply));
++	else if (method == u"contacts.snapshot"_q) reply(contactSnapshot(), {});
++	else if (method == u"presence.set"_q) setPresence(params, std::move(reply));
++	else if (method == u"directory.search"_q) searchDirectory(params, std::move(reply));
++	else if (method == u"directory.add"_q) addDirectoryContact(params, std::move(reply));
++	else reply({}, u"UNSUPPORTED_METHOD"_q);
++}
++void IcqramAccount::loadProfile(Reply reply) {
++	if (_profileRequest) return reply({}, u"BUSY"_q);
++	_profileReply = std::move(reply); _profileDeadline.callOnce(12000);
++	_profileRequest = _api.request(MTPusers_GetUsers(MTP_vector<MTPInputUser>(1, MTP_inputUserSelf()))).done(crl::guard(this, [=](const MTPVector<MTPUser> &users) {
++		_profileRequest = 0; _profileDeadline.cancel();
++		auto done = base::take(_profileReply);
++		if (!_allowed()) return done({}, u"LOCKED"_q);
++		if (users.v.size() != 1 || users.v.front().type() != mtpc_user || !users.v.front().c_user().is_self()) return done({}, u"ACCOUNT_UNAVAILABLE"_q);
++		_account->session().data().processUsers(users);
++		done({{u"profile"_q, profile()}}, {});
++	})).fail(crl::guard(this, [=](const MTP::Error &error) {
++		_profileRequest = 0; _profileDeadline.cancel();
++		if (auto done = base::take(_profileReply)) done({}, ErrorCode(error));
++	})).handleFloodErrors().send();
++}
++void IcqramAccount::loadContacts(Reply reply) {
++	if (_contactsReply) return reply({}, u"BUSY"_q);
++	_contactsReply = std::move(reply);
++	_contactsDeadline.callOnce(12000);
++	_contactsRequest = _api.request(MTPcontacts_GetContacts(MTP_long(0))).done(crl::guard(this, [=](const MTPcontacts_Contacts &result) {
++		_contactsRequest = 0; _contactsDeadline.cancel();
++		auto done = base::take(_contactsReply);
++		if (!_allowed()) return done({}, u"LOCKED"_q);
++		if (result.type() != mtpc_contacts_contacts) return done({}, u"CONTACTS_UNAVAILABLE"_q);
++		const auto &data = result.c_contacts_contacts();
++		auto ids = QSet<quint64>();
++		for (const auto &contact : data.vcontacts().v) {
++			if (contact.type() == mtpc_contact) ids.insert(contact.c_contact().vuser_id().v);
++		}
++		auto contacts = QJsonArray();
++		auto oldFilterExcluded = 0;
++		for (const auto &item : data.vusers().v) {
++			if (item.type() != mtpc_user) continue;
++			const auto &user = item.c_user();
++			if (!ids.contains(user.vid().v) || user.is_deleted()) continue;
++			if (user.is_self() || !user.is_contact()) ++oldFilterExcluded;
++			const auto status = user.vstatus();
++			const auto online = status && status->type() == mtpc_userStatusOnline
++				&& status->c_userStatusOnline().vexpires().v > QDateTime::currentSecsSinceEpoch();
++			const auto name = (qs(user.vfirst_name().value_or_empty()) + ' ' + qs(user.vlast_name().value_or_empty())).trimmed();
++			contacts.push_back(QJsonObject{
++				{u"id"_q, QString::number(user.vid().v)}, {u"name"_q, name.isEmpty() ? u"Telegram kullanıcısı"_q : name},
++				{u"username"_q, qs(user.vusername().value_or_empty())}, {u"self"_q, user.is_self()},
++				{u"state"_q, online ? u"online"_q : u"offline"_q},
++				{u"detail"_q, online ? u"Telegram: çevrimiçi"_q : u"Telegram çevrimiçi bilgisi görünmüyor."_q}
++			});
++		}
++		_account->session().data().processUsers(data.vusers());
++		LOG(("icqram contacts: members=%1 users=%2 returned=%3 oldFilterExcluded=%4")
++			.arg(ids.size()).arg(data.vusers().v.size()).arg(contacts.size()).arg(oldFilterExcluded));
++		_contactIds = ids;
++		_contactsReply = std::move(done);
++		_contactsDeadline.callOnce(12000);
++		loadPinnedContacts(PinnedBots(_account->session().userId().bare));
++	})).fail(crl::guard(this, [=](const MTP::Error &error) {
++		_contactsRequest = 0; _contactsDeadline.cancel();
++		if (auto done = base::take(_contactsReply)) done({}, ErrorCode(error));
++	})).handleFloodErrors().send();
++}
++void IcqramAccount::loadDialogs(bool reset, Reply reply) {
++	if (_dialogsReply) return reply({}, u"BUSY"_q);
++	if (reset) {
++		_dialogIds.clear(); _dialogFolder = 0; _dialogOffsetDate = 0;
++		_dialogOffsetId = 0; _dialogOffsetPeer = PeerId();
++		_dialogFirstPage = true; _dialogsComplete = false;
++	}
++	if (_dialogsComplete) return reply(contactSnapshot(), {});
++	_dialogsReply = std::move(reply);
++	_dialogsDeadline.callOnce(12000);
++	const auto offsetPeer = _dialogOffsetPeer
++		? _account->session().data().peerLoaded(_dialogOffsetPeer) : nullptr;
++	const auto flags = MTPmessages_GetDialogs::Flag::f_folder_id
++		| (_dialogFirstPage ? MTPmessages_GetDialogs::Flags() : MTPmessages_GetDialogs::Flag::f_exclude_pinned);
++	_dialogsRequest = _api.request(MTPmessages_GetDialogs(
++		MTP_flags(flags), MTP_int(_dialogFolder), MTP_int(_dialogOffsetDate),
++		MTP_int(_dialogOffsetId), offsetPeer ? offsetPeer->input() : MTP_inputPeerEmpty(),
++		MTP_int(100), MTP_long(0)))
++	.done(crl::guard(this, [=](const MTPmessages_Dialogs &result) {
++		_dialogsRequest = 0; _dialogsDeadline.cancel();
++		auto done = base::take(_dialogsReply);
++		if (!_allowed()) return done({}, u"LOCKED"_q);
++		auto nextDate = 0, nextId = 0;
++		auto nextPeer = PeerId();
++		auto complete = result.type() != mtpc_messages_dialogsSlice;
++		result.match([&](const MTPDmessages_dialogsNotModified &) {
++		}, [&](const auto &data) {
++			auto &session = _account->session().data();
++			session.processUsers(data.vusers()); session.processChats(data.vchats());
++			session.applyDialogs(_dialogFolder ? session.folder(_dialogFolder).get() : nullptr,
++				data.vmessages().v, data.vdialogs().v);
++			for (const auto &value : data.vdialogs().v) {
++				if (value.type() != mtpc_dialog) continue;
++				const auto &dialog = value.c_dialog();
++				const auto peerId = peerFromMTP(dialog.vpeer());
++				if (peerId) _dialogIds.insert(peerId);
++				if (dialog.is_pinned()) continue;
++				for (const auto &message : data.vmessages().v) {
++					if (PeerFromMessage(message) == peerId && IdFromMessage(message).bare == dialog.vtop_message().v) {
++						nextDate = DateFromMessage(message); nextId = dialog.vtop_message().v; nextPeer = peerId;
++						break;
++					}
++				}
++			}
++			if (data.vdialogs().v.empty()) complete = true;
++		});
++		if (!complete && !nextPeer && _dialogFirstPage) {
++			_dialogFirstPage = false;
++		} else if (complete || !nextPeer
++			|| (nextPeer == _dialogOffsetPeer && nextId == _dialogOffsetId)) {
++			if (_dialogFolder == 0) {
++				_dialogFolder = 1; _dialogOffsetDate = 0; _dialogOffsetId = 0;
++				_dialogOffsetPeer = PeerId(); _dialogFirstPage = true;
++			} else _dialogsComplete = true;
++		} else {
++			_dialogOffsetPeer = nextPeer; _dialogOffsetId = nextId;
++			_dialogOffsetDate = nextDate; _dialogFirstPage = false;
++		}
++		done(contactSnapshot(), {});
++	})).fail(crl::guard(this, [=](const MTP::Error &error) {
++		_dialogsRequest = 0; _dialogsDeadline.cancel();
++		if (auto done = base::take(_dialogsReply)) done({}, ErrorCode(error));
++	})).handleFloodErrors().send();
++}
++QJsonObject IcqramAccount::contactSnapshot() const {
++	auto contacts = QJsonArray();
++	auto ids = _dialogIds;
++	for (const auto id : _contactIds) ids.insert(peerFromUser(UserId(id)));
++	for (const auto id : ids) {
++		const auto peer = _account->session().data().peerLoaded(id);
++		if (!peer) continue;
++		const auto user = peer->asUser();
++		if (user && (user->isInaccessible() || (user->isSelf() && !_contactIds.contains(peerToUser(id).bare)))) continue;
++		if (const auto chat = peer->asChat()) { if (!chat->amIn() || chat->migrateTo()) continue; }
++		if (const auto channel = peer->asChannel()) { if (!channel->amIn()) continue; }
++		const auto online = user && !user->isBot() && user->lastseen().isOnline(QDateTime::currentSecsSinceEpoch());
++		const auto history = _account->session().data().history(peer);
++		const auto painter = history->sendActionPainter(); painter->updateNeedsAnimating(crl::now());
++		const auto kind = user ? (user->isBot() ? u"bot"_q : u"user"_q) : peer->isBroadcast() ? u"channel"_q : u"group"_q;
++		auto item = user ? DirectoryUser(user) : QJsonObject{
++			{u"id"_q,IcqramPeerKey(id)}, {u"name"_q,peer->name()}, {u"username"_q,peer->username()}};
++		item.insert(u"kind"_q,kind);
++		item.insert(u"state"_q,online ? u"online"_q : u"offline"_q);
++		item.insert(u"blocked"_q,user && user->isBlocked());
++		item.insert(u"typing"_q,painter->actionText());
++		item.insert(u"unread"_q,history->unreadCountKnown() ? history->unreadCount() : 0);
++		item.insert(u"detail"_q,kind == u"group"_q ? u"Telegram grubu"_q : kind == u"channel"_q ? u"Telegram kanalı"_q : kind == u"bot"_q ? u"Telegram botu"_q : online ? u"Online"_q : u"Offline"_q);
++		contacts.push_back(item);
++	}
++	return {{u"contacts"_q,contacts}, {u"hasMoreDialogs"_q,!_dialogsComplete},
++		{u"profileAvatar"_q, QJsonObject{{u"uin"_q, QString::number(_account->session().userId().bare)}, {u"avatar"_q, profileAvatar()}}}};
++}
++void IcqramAccount::loadPinnedContacts(QStringList entries, int index) {
++	if (!_contactsReply) return;
++	if (!_allowed()) { _contactsDeadline.cancel(); auto done = base::take(_contactsReply); return done({}, u"LOCKED"_q); }
++	if (index >= entries.size() || index >= 100) {
++        for (const auto id : _contactIds) {
++            if (const auto user = _account->session().data().userLoaded(UserId(id))) {
++                _account->session().data().histories().requestDialogEntry(_account->session().data().history(user));
++            }
++        }
++		_contactsDeadline.cancel(); _contactsRequest = 0;
++		auto done = base::take(_contactsReply); return done(contactSnapshot(), {});
++	}
++	const auto entry = entries[index];
++	const auto id = entry.section(':', 0, 0).toULongLong();
++	const auto username = entry.section(':', 1);
++	if (!id || username.isEmpty()) return loadPinnedContacts(entries, index + 1);
++	if (const auto user = _account->session().data().userLoaded(UserId(id)); user && user->accessHash()) {
++		_contactIds.insert(id); return loadPinnedContacts(entries, index + 1);
++	}
++	_contactsRequest = _api.request(MTPcontacts_ResolveUsername(MTP_flags(0), MTP_string(username), MTPstring()))
++	.done(crl::guard(this, [=](const MTPcontacts_ResolvedPeer &result) {
++		_contactsRequest = 0;
++		if (!_contactsReply || !_allowed()) return;
++		const auto &data = result.c_contacts_resolvedPeer();
++		_account->session().data().processUsers(data.vusers());
++		if (data.vpeer().type() == mtpc_peerUser && data.vpeer().c_peerUser().vuser_id().v == id) _contactIds.insert(id);
++		loadPinnedContacts(entries, index + 1);
++	})).fail(crl::guard(this, [=](const MTP::Error &) { _contactsRequest = 0; loadPinnedContacts(entries, index + 1); })).handleFloodErrors().send();
++}
++void IcqramAccount::finishDirectory(QJsonObject result, QString error) {
++	_directoryDeadline.cancel(); _directoryRequest = 0; _directoryAdding = false;
++	if (auto done = base::take(_directoryReply)) done(std::move(result), std::move(error));
++}
++void IcqramAccount::searchDirectory(const QJsonObject &params, Reply reply) {
++	if (_directoryReply) return reply({}, u"BUSY"_q);
++	if (crl::now() < _retryDirectoryAt) return reply({}, u"FLOOD_WAIT"_q);
++	const auto mode = params.value(u"mode"_q).toString();
++	auto query = params.value(u"query"_q).toString().trimmed();
++	_directoryIds.clear();
++	if (mode == u"uin"_q) {
++		static const auto valid = QRegularExpression(u"^[1-9][0-9]{0,15}$"_q);
++		if (!valid.match(query).hasMatch()) return reply({}, u"INVALID_QUERY"_q);
++		const auto user = _account->session().data().userLoaded(UserId(query.toULongLong()));
++		auto users = QJsonArray();
++		if (user && !user->isInaccessible() && (user->accessHash() || user->isSelf())) {
++			users.push_back(DirectoryUser(user)); _directoryIds.insert(query.toULongLong());
++		}
++		return reply({{u"users"_q, users}, {u"knownOnly"_q, true}}, {});
++	}
++	if (mode != u"username"_q) return reply({}, u"UNSUPPORTED_SEARCH"_q);
++	if (query.startsWith('@')) query.remove(0, 1);
++	static const auto valid = QRegularExpression(u"^[A-Za-z0-9_]{5,32}$"_q);
++	if (!valid.match(query).hasMatch()) return reply({}, u"INVALID_QUERY"_q);
++	_directoryReply = std::move(reply); _directoryDeadline.callOnce(12000);
++	_directoryRequest = _api.request(MTPcontacts_Search(MTP_flags(0), MTP_string(query), MTP_int(50)))
++	.done(crl::guard(this, [=](const MTPcontacts_Found &result) {
++		if (!_allowed()) return finishDirectory({}, u"LOCKED"_q);
++		const auto &data = result.c_contacts_found();
++		_account->session().data().processUsers(data.vusers());
++		auto users = QJsonArray();
++		const auto collect = [&](const auto &peers) {
++			for (const auto &peer : peers.v) {
++				if (peer.type() != mtpc_peerUser) continue;
++				const auto id = peer.c_peerUser().vuser_id().v;
++				const auto user = _account->session().data().userLoaded(UserId(id));
++				if (!user || user->isInaccessible() || _directoryIds.contains(id) || (!user->accessHash() && !user->isSelf())) continue;
++				_directoryIds.insert(id); users.push_back(DirectoryUser(user));
++			}
++		};
++		collect(data.vmy_results()); collect(data.vresults());
++		_retryDirectoryAt = crl::now() + 1000;
++		finishDirectory({{u"users"_q, users}}, {});
++	})).fail(crl::guard(this, [=](const MTP::Error &error) {
++		if (MTP::IsFloodError(error)) _retryDirectoryAt = crl::now() + crl::time(std::clamp(error.type().section('_', -1).toInt(), 30, 86400)) * 1000;
++		finishDirectory({}, MTP::IgnoreError(error) ? u"SILENT"_q : ErrorCode(error));
++	})).handleFloodErrors().send();
++}
++void IcqramAccount::addDirectoryContact(const QJsonObject &params, Reply reply) {
++	if (_directoryReply) return reply({}, u"BUSY"_q);
++	if (crl::now() < _retryDirectoryAt) return reply({}, u"FLOOD_WAIT"_q);
++	const auto id = params.value(u"id"_q).toString().toULongLong();
++	const auto user = _directoryIds.contains(id) ? _account->session().data().userLoaded(UserId(id)) : nullptr;
++	if (!user || user->isInaccessible()) return reply({}, u"PEER_UNAVAILABLE"_q);
++	if (user->isSelf()) return reply({}, u"OPEN_CHAT_INSTEAD"_q);
++	if (user->isBot()) {
++		auto settings = QSettings(u"icqram"_q, u"icqram"_q);
++		const auto key = PinnedKey(_account->session().userId().bare);
++		auto entries = settings.value(key).toStringList();
++		const auto entry = QString::number(id) + ':' + user->username();
++		if (!entries.contains(entry)) { if (entries.size() >= 100) return reply({}, u"LIST_FULL"_q); entries.push_back(entry); }
++		settings.setValue(key, entries); settings.sync();
++		if (settings.status() != QSettings::NoError) return reply({}, u"SAVE_FAILED"_q);
++		return reply({{u"added"_q, true}, {u"listed"_q, true}}, {});
++	}
++	if (user->isContact()) return reply({{u"added"_q, true}}, {});
++	_directoryAdding = true; _directoryReply = std::move(reply); _directoryDeadline.callOnce(12000);
++	_directoryRequest = _api.request(MTPcontacts_AddContact(
++		MTP_flags(0), user->inputUser(), MTP_string(user->firstName), MTP_string(user->lastName), MTP_string(QString()), MTPTextWithEntities()
++	)).done(crl::guard(this, [=](const MTPUpdates &updates) {
++		if (!_allowed()) return finishDirectory({}, u"LOCKED"_q);
++		_account->session().api().applyUpdates(updates);
++		finishDirectory({{u"added"_q, true}}, {});
++	})).fail(crl::guard(this, [=](const MTP::Error &error) {
++		if (MTP::IsFloodError(error)) _retryDirectoryAt = crl::now() + crl::time(std::clamp(error.type().section('_', -1).toInt(), 30, 86400)) * 1000;
++		finishDirectory({}, MTP::IgnoreError(error) ? u"SILENT"_q : ErrorCode(error));
++	})).handleFloodErrors().send();
++}
++void IcqramAccount::finishPresence(QJsonObject result, QString error) {
++	_presenceDeadline.cancel(); _presenceRequest = 0;
++	if (auto done = base::take(_presenceReply)) done(std::move(result), std::move(error));
++}
++void IcqramAccount::setPresence(const QJsonObject &params, Reply reply) {
++	const auto code = params.value(u"code"_q).toString();
++	static const auto codes = QSet<QString>{ u"AV"_q,u"FC"_q,u"AW"_q,u"NA"_q,u"OC"_q,u"DND"_q,u"IV"_q,u"OF"_q,u"PH"_q,u"LC"_q,u""_q };
++	if (!codes.contains(code) || !params.value(u"publish"_q).toBool()) return reply({}, u"PRESENCE_INVALID"_q);
++	if (params.contains(u"shareChanges"_q) && !params.value(u"shareChanges"_q).isBool()) return reply({}, u"PRESENCE_INVALID"_q);
++    if (_presenceReply) return reply({}, u"BUSY"_q);
++	if (crl::now() < _retryPresenceAt) return reply({}, u"FLOOD_WAIT"_q);
++	_presenceReply = std::move(reply); _presenceDeadline.callOnce(20000);
++    const auto success = crl::guard(this, [=] {
++        if (params.contains(u"shareChanges"_q)) {
++            auto settings=QSettings(u"icqram"_q,u"icqram"_q);
++            settings.setValue(u"accounts/"_q + QString::number(_account->session().userId().bare) + u"/shareStatus"_q,params.value(u"shareChanges"_q).toBool());
++            settings.sync();
++            if(settings.status()!=QSettings::NoError)return finishPresence({},u"SAVE_FAILED"_q);
++        }
++        finishPresence({{u"profile"_q,profile()}},{});
++    });
++	const auto fail = crl::guard(this, [=](const MTP::Error &error) {
++		if (MTP::IsFloodError(error)) {
++			const auto seconds = error.type().section('_', -1).toInt();
++			_retryPresenceAt = crl::now() + crl::time(std::clamp(seconds, 30, 86400)) * 1000;
++		}
++		finishPresence({}, ErrorCode(error));
++	});
++	_presenceRequest = _api.request(MTPusers_GetUsers(MTP_vector<MTPInputUser>(1, MTP_inputUserSelf()))).done(crl::guard(this, [=](const MTPVector<MTPUser> &users) {
++		if (!_allowed()) return finishPresence({}, u"LOCKED"_q);
++		if (users.v.size() != 1 || users.v.front().type() != mtpc_user || !users.v.front().c_user().is_self()) return finishPresence({}, u"ACCOUNT_UNAVAILABLE"_q);
++		_account->session().data().processUsers(users);
++		const auto current = profile();
++		if (current.value(u"firstName"_q) != params.value(u"firstName"_q) || current.value(u"lastName"_q) != params.value(u"lastName"_q)) {
++			return finishPresence({}, u"PROFILE_CHANGED"_q);
++		}
++		const auto last = current.value(u"lastName"_q).toString().remove(StatusSuffix()).trimmed();
++		const auto next = code.isEmpty() ? last : (last + (last.isEmpty() ? u""_q : u" "_q) + u"[ST:"_q + code + ']').trimmed();
++		if (next.size() > 64) return finishPresence({}, u"NAME_TOO_LONG"_q);
++		if (next == current.value(u"lastName"_q).toString()) return success();
++		_presenceRequest = _api.request(MTPaccount_UpdateProfile(
++			MTP_flags(MTPaccount_UpdateProfile::Flag::f_last_name), MTPstring(), MTP_string(next), MTPstring()
++		)).done(crl::guard(this, [=](const MTPUser &user) {
++			if (!_allowed()) return finishPresence({}, u"LOCKED"_q);
++			_account->session().data().processUser(user);
++			_retryPresenceAt = crl::now() + 5000;
++			success();
++		})).fail(fail).handleFloodErrors().send();
++	})).fail(fail).handleFloodErrors().send();
++}
++}
+diff --git a/Telegram/SourceFiles/api/api_icqram_account.h b/Telegram/SourceFiles/api/api_icqram_account.h
+new file mode 100644
+index 0000000000..11db905363
+--- /dev/null
++++ b/Telegram/SourceFiles/api/api_icqram_account.h
+@@ -0,0 +1,66 @@
++#pragma once
++
++#include "base/timer.h"
++#include "ui/userpic_view.h"
++#include "data/data_peer_id.h"
++#include "mtproto/sender.h"
++#include <QtCore/QObject>
++#include <QtCore/QJsonObject>
++#include <QtCore/QSet>
++
++namespace Main { class Account; }
++namespace Api {
++PeerId IcqramPeerId(const QString &key);
++QString IcqramPeerKey(PeerId id);
++class IcqramAccount final : public QObject {
++public:
++	using Reply = Fn<void(QJsonObject, QString)>;
++	IcqramAccount(not_null<Main::Account*> account, Fn<bool()> allowed);
++	void request(const QString &method, const QJsonObject &params, Reply reply);
++private:
++	QJsonObject profile() const;
++	QString profileAvatar() const;
++	mutable Ui::PeerUserpicView _profileUserpic;
++	void loadContacts(Reply reply);
++	void loadDialogs(bool reset, Reply reply);
++	QSet<PeerId> _dialogIds;
++	base::Timer _dialogsDeadline;
++	mtpRequestId _dialogsRequest = 0;
++	Reply _dialogsReply;
++	int _dialogFolder = 0;
++	int _dialogOffsetDate = 0;
++	int _dialogOffsetId = 0;
++	PeerId _dialogOffsetPeer;
++	bool _dialogFirstPage = true;
++	bool _dialogsComplete = false;
++	void loadPinnedContacts(QStringList entries, int index = 0);
++	QJsonObject contactSnapshot() const;
++	QSet<quint64> _contactIds;
++	void loadProfile(Reply reply);
++	void setPresence(const QJsonObject &params, Reply reply);
++	void finishPresence(QJsonObject result = {}, QString error = {});
++	void searchDirectory(const QJsonObject &params, Reply reply);
++	void addDirectoryContact(const QJsonObject &params, Reply reply);
++	void finishDirectory(QJsonObject result = {}, QString error = {});
++	base::Timer _directoryDeadline;
++	mtpRequestId _directoryRequest = 0;
++	Reply _directoryReply;
++	QSet<quint64> _directoryIds;
++	crl::time _retryDirectoryAt = 0;
++	bool _directoryAdding = false;
++	const not_null<Main::Account*> _account;
++	Fn<bool()> _allowed;
++	MTP::Sender _api;
++	base::Timer _contactsDeadline;
++	base::Timer _profileDeadline;
++	base::Timer _presenceDeadline;
++	mtpRequestId _contactsRequest = 0;
++	mtpRequestId _profileRequest = 0;
++	mtpRequestId _presenceRequest = 0;
++	Reply _contactsReply;
++	Reply _profileReply;
++	Reply _presenceReply;
++	crl::time _retryPresenceAt = 0;
++
++};
++}
+diff --git a/Telegram/SourceFiles/api/api_icqram_chat.cpp b/Telegram/SourceFiles/api/api_icqram_chat.cpp
+new file mode 100644
+index 0000000000..3add9199d2
+--- /dev/null
++++ b/Telegram/SourceFiles/api/api_icqram_chat.cpp
+@@ -0,0 +1,624 @@
++#include "api/api_icqram_chat.h"
++#include "api/api_icqram_account.h"
++#include "data/data_channel.h"
++#include "data/data_forum.h"
++#include "data/data_forum_topic.h"
++#include "data/data_replies_list.h"
++#include "data/data_chat_participant_status.h"
++
++#include "apiwrap.h"
++#include "base/random.h"
++#include "main/main_account.h"
++#include "main/main_session.h"
++#include "data/data_session.h"
++#include "data/data_histories.h"
++#include "data/data_drafts.h"
++#include "storage/storage_account.h"
++#include "data/data_user.h"
++#include "data/data_peer_bot_command.h"
++#include "data/data_changes.h"
++#include "history/history.h"
++#include "history/history_item.h"
++#include "history/view/history_view_send_action.h"
++#include "data/data_document.h"
++#include "data/data_photo.h"
++#include "data/data_photo_media.h"
++#include "ui/image/image.h"
++#include "data/data_file_origin.h"
++#include <QtCore/QFile>
++#include <QtCore/QSaveFile>
++#include <QtCore/QTemporaryDir>
++#include <QtCore/QStorageInfo>
++#include <QtCore/QFileInfo>
++#include <QtCore/QCryptographicHash>
++#include <QtCore/QUuid>
++#include <QtCore/QMimeDatabase>
++#include <QtCore/QStandardPaths>
++#include <QtCore/QDir>
++#include <QtWidgets/QFileDialog>
++#include <QtWidgets/QApplication>
++#include <QtCore/QJsonArray>
++#include <QtCore/QBuffer>
++#include <QtGui/QImage>
++#include <QtCore/QDateTime>
++#include <QtCore/QRegularExpression>
++
++namespace Api {
++IcqramChat::IcqramChat(not_null<Main::Account*> account, QString peerId, Fn<bool()> allowed, Fn<void()> changed)
++: _account(account)
++, _peerId(std::move(peerId))
++, _allowed(std::move(allowed))
++, _api(&account->mtp()) {
++	_topicsDeadline.setCallback([=] { _api.request(base::take(_topicsRequest)).cancel(); if (auto reply = base::take(_topicsReply)) reply({}, u"TIMEOUT"_q); });
++	_uploadDeadline.setCallback([=] { _api.request(base::take(_uploadRequest)).cancel(); failUpload(u"TIMEOUT"_q); });
++	_blockDeadline.setCallback([=] { _api.request(base::take(_blockRequest)).cancel(); if (auto reply = base::take(_blockReply)) reply({}, u"TIMEOUT"_q); });
++	_historyDeadline.setCallback([=] {
++		_api.request(base::take(_historyRequest)).cancel();
++		if (auto reply = base::take(_historyReply)) reply({}, u"TIMEOUT"_q);
++	});
++	_sendDeadline.setCallback([=] {
++		_api.request(base::take(_sendRequest)).cancel();
++		if (auto reply = base::take(_sendReply)) reply({}, u"SEND_UNCERTAIN"_q);
++	});
++	if (const auto user = peer()) {
++		_userpic = user->createUserpicView();
++		user->loadUserpic();
++		account->session().api().requestFullPeer(user);
++		const auto history = account->session().data().history(user);
++		account->session().local().readDraftsWithCursors(history);
++		account->session().data().histories().requestDialogEntry(history);
++	}
++	account->session().downloaderTaskFinished() | rpl::on_next([=] {
++		const auto user = peer();
++		if (_awaitingPhoto && user && !user->useEmptyUserpic(_userpic)) {
++			_awaitingPhoto = false;
++			if (_allowed()) changed();
++		}
++	}, _lifetime);
++	using Flag = Data::MessageUpdate::Flag;
++	account->session().changes().messageUpdates(Flag::NewAdded | Flag::NewMaybeAdded | Flag::Edited | Flag::Destroyed)
++		| rpl::on_next([=](const Data::MessageUpdate &update) {
++			if (_allowed() && update.item->history()->peer == peer()) changed();
++		}, _lifetime);
++}
++IcqramChat::~IcqramChat() { cancelMedia(_playbackId); }
++PeerData *IcqramChat::peer() const {
++	const auto session = _account->maybeSession();
++	return session ? session->data().peerLoaded(IcqramPeerId(_peerId)) : nullptr;
++}
++Data::ForumTopic *IcqramChat::topic() const {
++    return peer() && _topicId ? peer()->forumTopicFor(MsgId(_topicId)) : nullptr;
++}
++bool IcqramChat::canSend(bool files) const {
++    const auto right = files ? ChatRestriction::SendFiles : ChatRestriction::SendOther;
++    if (peer()->isForum()) {
++        const auto selected = topic();
++        return selected && !selected->dying() && !selected->hidden() && Data::CanSend(selected, right);
++    }
++    return Data::CanSend(peer(), right);
++}
++MTPInputReplyTo IcqramChat::replyTo() const {
++    if (!_topicId || _topicId == 1) return MTPInputReplyTo();
++    return Data::ReplyToForMTP(_account->session().data().history(peer()), FullReplyTo{
++        .messageId = FullMsgId(peer()->id, MsgId(_topicId)),
++        .topicRootId = MsgId(_topicId),
++    });
++}
++void IcqramChat::topics(bool reset, Reply reply) {
++    const auto forum = peer()->forum();
++    if (!forum) return reply({{u"topics"_q, QJsonArray()}, {u"hasMore"_q, false}}, {});
++    if (_topicsRequest) return reply({}, u"BUSY"_q);
++    if (reset) { _topicIds.clear(); _topicOffsetDate = _topicOffsetId = _topicOffsetTopic = 0; _topicsComplete = false; }
++    if (_topicsComplete) return reply({{u"hasMore"_q, false}, {u"peer"_q, state()}}, {});
++    _topicsReply = std::move(reply); _topicsDeadline.callOnce(12000);
++    _topicsRequest = _api.request(MTPmessages_GetForumTopics(MTP_flags(0), peer()->input(), MTPstring(), MTP_int(_topicOffsetDate), MTP_int(_topicOffsetId), MTP_int(_topicOffsetTopic), MTP_int(100)))
++    .done(crl::guard(this, [=](const MTPmessages_ForumTopics &result) {
++        _topicsRequest = 0; _topicsDeadline.cancel(); auto done = base::take(_topicsReply);
++        if (!_allowed() || !peer() || !peer()->forum()) return done({}, u"LOCKED"_q);
++        auto offset = Data::ForumOffsets{TimeId(_topicOffsetDate), MsgId(_topicOffsetId), MsgId(_topicOffsetTopic)};
++        const auto previous = offset;
++        if (!peer()->forum()->applyReceivedTopics(result, offset)) return done({}, u"TOPICS_UNAVAILABLE"_q);
++        for (const auto &entry : result.data().vtopics().v) {
++            if (entry.type() == mtpc_forumTopic) _topicIds.insert(entry.c_forumTopic().vid().v);
++        }
++        _topicOffsetDate = offset.date; _topicOffsetId = offset.id.bare; _topicOffsetTopic = offset.topicId.bare;
++        _topicsComplete = result.data().vtopics().v.isEmpty() || _topicIds.size() >= result.data().vcount().v || offset == previous;
++        done({{u"peer"_q, state()}, {u"hasMore"_q, !_topicsComplete}}, {});
++    })).fail(crl::guard(this, [=](const MTP::Error &error) {
++        _topicsRequest = 0; _topicsDeadline.cancel();
++        if (auto done = base::take(_topicsReply)) done({}, MTP::IsFloodError(error) ? u"FLOOD_WAIT"_q : u"TOPICS_UNAVAILABLE"_q);
++    })).handleFloodErrors().send();
++}
++void IcqramChat::selectTopic(int id, Reply reply) {
++    const auto selected = peer()->forumTopicFor(MsgId(id));
++    if (!peer()->isForum() || !_topicIds.contains(id) || !selected || selected->dying() || selected->hidden()) return reply({}, u"TOPIC_UNAVAILABLE"_q);
++    const auto transfer = _transfer.value(u"state"_q).toString();
++    if (_sendRequest || _uploadRequest || transfer == u"ready"_q || transfer == u"uploading"_q || transfer == u"sending"_q || transfer == u"uncertain"_q) return reply({}, u"BUSY"_q);
++    if (_typingSent) {
++        _api.request(MTPmessages_SetTyping(MTP_flags(MTPmessages_SetTyping::Flag::f_top_msg_id), peer()->input(), MTP_int(_topicId), MTP_sendMessageCancelAction())).send();
++        _typingSent = false;
++    }
++    _api.request(base::take(_historyRequest)).cancel(); _historyDeadline.cancel();
++    if (auto pending = base::take(_historyReply)) pending({}, u"TOPIC_CHANGED"_q);
++    _knownIncoming.clear();
++    _topicId = id;
++    reply(state(), {});
++}
++QJsonObject IcqramChat::state() {
++	const auto user = peer();
++	const auto person = user->asUser();
++	const auto history = _account->session().data().history(user);
++	const auto selected = topic();
++	const auto painter = selected ? selected->sendActionPainter() : history->sendActionPainter();
++	auto commands = QJsonArray();
++	const auto bot = person ? person->botInfo.get() : nullptr;
++	if (bot) {
++		static const auto validCommand = QRegularExpression(u"^[a-zA-Z0-9_]{1,32}$"_q);
++		for (const auto &command : bot->commands) {
++			if (commands.size() >= 100) break;
++			if (!validCommand.match(command.command).hasMatch()) continue;
++			commands.push_back(QJsonObject{
++				{ u"command"_q, command.command },
++				{ u"description"_q, command.description.left(256) },
++			});
++		}
++	}
++	auto topicList = QJsonArray();
++	for (const auto id : _topicIds) {
++		const auto item = user->forumTopicFor(MsgId(id));
++		if (!item || item->dying() || item->hidden()) continue;
++		topicList.push_back(QJsonObject{{u"id"_q,id},{u"title"_q,item->title()},{u"color"_q,item->colorId()},{u"closed"_q,item->closed()}});
++	}
++	// Expire actions even when the upstream Qt history is not being painted.
++	painter->updateNeedsAnimating(crl::now());
++	auto photoStates = QJsonArray();
++    for (auto i = _photoViews.begin(); i != _photoViews.end(); ++i) {
++        const auto media = i.value(); const auto photo = media->owner();
++        photoStates.push_back(QJsonObject{{u"messageId"_q,i.key()}, {u"state"_q,media->loaded() ? u"done"_q : photo->loading() ? u"loading"_q : u"failed"_q}, {u"bytes"_q,photo->loadOffset()}, {u"size"_q,photo->imageByteSize(Data::PhotoSize::Large)}});
++    }
++    auto transfers = QJsonArray();
++	if (!_transfer.isEmpty()) transfers.push_back(_transfer);
++	for (auto i = _downloads.begin(); i != _downloads.end(); ++i) {
++		auto &download = i.value();
++		const auto document = download.document;
++		if (download.state == u"downloading"_q && !document->loading()) {
++			const auto saved = document->status != FileDownloadFailed
++                && !document->cancelled()
++                && QFileInfo(document->filepath(true)).absoluteFilePath() == QFileInfo(download.path).absoluteFilePath()
++                && QFileInfo(download.path).isFile()
++                && QFileInfo(download.path).size() == document->size;
++            download.state = saved ? u"done"_q : document->cancelled() ? u"cancelled"_q : u"failed"_q;
++		}
++		transfers.push_back(QJsonObject{{u"messageId"_q, i.key()}, {u"direction"_q, u"download"_q}, {u"name"_q, document->filename()}, {u"size"_q, document->size}, {u"bytes"_q, download.state == u"done"_q ? document->size : document->loadOffset()}, {u"state"_q, download.state}});
++	}
++	return {{u"commands"_q, commands}, {u"commandsReady"_q, bot && bot->inited}, {u"id"_q, _peerId}, {u"name"_q, user->name()}, {u"username"_q, user->username()}, {u"bot"_q, user->isBot()}, {u"self"_q, user->isSelf()}, {u"online"_q, person && person->lastseen().isOnline(QDateTime::currentSecsSinceEpoch())}, {u"group"_q,!person && !user->isBroadcast()}, {u"channel"_q,user->isBroadcast()}, {u"forum"_q,user->isForum()}, {u"topicId"_q,_topicId}, {u"topics"_q,topicList}, {u"topicTitle"_q,selected ? selected->title() : QString()}, {u"canSend"_q,canSend()}, {u"canSendFiles"_q,canSend(true)}, {u"blocked"_q, user->isBlocked()}, {u"typing"_q, painter->actionText()}, {u"transfers"_q, transfers}, {u"photos"_q, photoStates}, {u"readOutboxMaxId"_q, history->outboxReadTillId().bare}, {u"readInboxMaxId"_q, selected ? selected->replies()->inboxReadTillId().bare : history->inboxReadTillId().bare}, {u"unread"_q, history->unreadCountKnown() ? history->unreadCount() : 0}};
++}
++void IcqramChat::saveDraft(const QString &text) {
++    const auto history = _account->session().data().history(peer());
++    const auto existing = history->localDraft(MsgId(_topicId), PeerId());
++    if (existing && existing->textWithTags.text == text) return;
++    if (text.isEmpty()) history->clearLocalDraft(MsgId(_topicId), PeerId());
++    else {
++        auto draft = std::make_unique<Data::Draft>();
++        draft->textWithTags.text = text;
++        draft->reply.topicRootId = MsgId(_topicId);
++        history->setLocalDraft(std::move(draft));
++    }
++    _account->session().local().writeDrafts(history);
++}
++void IcqramChat::block(bool blocked, Reply reply) {
++	if (!peer()->asUser() || peer()->isSelf()) return reply({}, u"BLOCK_FAILED"_q);
++	if (_blockRequest) return reply({}, u"BUSY"_q);
++	_blockReply = std::move(reply); _blockDeadline.callOnce(12000);
++	const auto done = crl::guard(this, [=](const MTPBool &result) {
++		_blockRequest = 0; _blockDeadline.cancel(); auto reply = base::take(_blockReply);
++		if (!_allowed()) return reply({}, u"LOCKED"_q);
++		if (result.type() != mtpc_boolTrue) return reply({}, u"BLOCK_FAILED"_q);
++		peer()->setIsBlocked(blocked); reply(state(), {});
++	});
++	const auto fail = crl::guard(this, [=](const MTP::Error &error) { _blockRequest = 0; _blockDeadline.cancel(); if (auto reply = base::take(_blockReply)) reply({}, MTP::IsFloodError(error) ? u"FLOOD_WAIT"_q : u"BLOCK_FAILED"_q); });
++	if (blocked) _blockRequest = _api.request(MTPcontacts_Block(MTP_flags(0), peer()->input())).done(done).fail(fail).handleFloodErrors().send();
++	else _blockRequest = _api.request(MTPcontacts_Unblock(MTP_flags(0), peer()->input())).done(done).fail(fail).handleFloodErrors().send();
++}
++void IcqramChat::chooseFile(Reply reply) {
++	if (!canSend(true)) return reply({}, u"CHAT_READ_ONLY"_q);
++	if (_uploadRequest || peer()->isBlocked()) return reply({}, u"BUSY"_q);
++	const auto path = QFileDialog::getOpenFileName(QApplication::activeWindow(), u"Gönderilecek dosyayı seç"_q);
++	if (!_allowed()) return reply({}, u"LOCKED"_q);
++	if (path.isEmpty()) return reply({{u"cancelled"_q, true}}, {});
++	const auto info = QFileInfo(path);
++	if (!info.isFile() || !info.isReadable() || info.size() <= 0 || info.size() > qint64(2000) * 1024 * 1024) return reply({}, u"INVALID_FILE"_q);
++	_selectedFile = info.canonicalFilePath(); _fileToken = QUuid::createUuid().toString(QUuid::WithoutBraces);
++	_transfer = {{u"direction"_q, u"upload"_q}, {u"token"_q, _fileToken}, {u"state"_q, u"ready"_q}, {u"name"_q, info.fileName()}, {u"size"_q, info.size()}, {u"bytes"_q, 0}};
++	reply({{u"token"_q, _fileToken}, {u"name"_q, info.fileName()}, {u"size"_q, info.size()}}, {});
++}
++void IcqramChat::startFile(const QString &token, Reply reply) {
++	if (!canSend(true)) return reply({}, u"CHAT_READ_ONLY"_q);
++	if (_uploadRequest || peer()->isBlocked()) return reply({}, u"BUSY"_q);
++	if (token.isEmpty() || token != _fileToken || _transfer.value(u"state"_q) != u"ready"_q) return reply({}, u"INVALID_FILE"_q);
++	_uploadFile = std::make_unique<QFile>(_selectedFile);
++	if (!_uploadFile->open(QIODevice::ReadOnly) || _uploadFile->size() != _transfer.value(u"size"_q).toInteger()) return reply({}, u"FILE_CHANGED"_q);
++	_uploadId = base::RandomValue<uint64>(); _fileRandomId = base::RandomValue<uint64>();
++	_part = 0; _parts = int((_uploadFile->size() + 524287) / 524288);
++	_fileHash = std::make_unique<QCryptographicHash>(QCryptographicHash::Md5);
++	_transfer.insert(u"state"_q, u"uploading"_q);
++	uploadPart(); reply({{u"started"_q, true}}, {});
++}
++void IcqramChat::failUpload(QString error) {
++	_uploadDeadline.cancel(); _uploadRequest = 0;
++	if (_uploadFile) _uploadFile->close();
++	_transfer.insert(u"state"_q, _transfer.value(u"state"_q) == u"sending"_q ? u"uncertain"_q : u"failed"_q);
++	_transfer.insert(u"error"_q, error);
++}
++void IcqramChat::uploadPart() {
++	if (!_allowed()) return failUpload(u"LOCKED"_q);
++	if (_part >= _parts) return finishUpload();
++	const auto size = _transfer.value(u"size"_q).toInteger();
++	if (_uploadFile->size() != size) return failUpload(u"FILE_CHANGED"_q);
++	const auto expected = std::min(qint64(524288), size - qint64(_part) * 524288);
++	const auto bytes = _uploadFile->read(expected);
++	if (bytes.size() != expected) return failUpload(u"READ_FAILED"_q);
++	_fileHash->addData(bytes); _uploadDeadline.callOnce(60000);
++	const auto done = crl::guard(this, [=](const MTPBool &result) {
++		_uploadRequest = 0;
++		if (result.type() != mtpc_boolTrue) return failUpload(u"UPLOAD_FAILED"_q);
++		++_part; _transfer.insert(u"bytes"_q, std::min(qint64(_part) * 524288, _uploadFile->size())); uploadPart();
++	});
++	const auto fail = crl::guard(this, [=](const MTP::Error &) { failUpload(u"UPLOAD_FAILED"_q); });
++	if (_uploadFile->size() > 10 * 1024 * 1024) _uploadRequest = _api.request(MTPupload_SaveBigFilePart(MTP_long(_uploadId), MTP_int(_part), MTP_int(_parts), MTP_bytes(bytes))).done(done).fail(fail).handleFloodErrors().send();
++	else _uploadRequest = _api.request(MTPupload_SaveFilePart(MTP_long(_uploadId), MTP_int(_part), MTP_bytes(bytes))).done(done).fail(fail).handleFloodErrors().send();
++}
++void IcqramChat::finishUpload() {
++	if (!canSend(true)) return failUpload(u"CHAT_READ_ONLY"_q);
++	const auto name = QFileInfo(_selectedFile).fileName();
++	const auto file = _uploadFile->size() > 10 * 1024 * 1024
++		? MTPInputFile(MTP_inputFileBig(MTP_long(_uploadId), MTP_int(_parts), MTP_string(name)))
++		: MTPInputFile(MTP_inputFile(MTP_long(_uploadId), MTP_int(_parts), MTP_string(name), MTP_string(QString::fromLatin1(_fileHash->result().toHex()))));
++	_uploadFile->close();
++	const auto media = MTP_inputMediaUploadedDocument(MTP_flags(MTPDinputMediaUploadedDocument::Flag::f_force_file), file, MTPInputFile(), MTP_string(QMimeDatabase().mimeTypeForFile(name, QMimeDatabase::MatchExtension).name()), MTP_vector<MTPDocumentAttribute>(1, MTP_documentAttributeFilename(MTP_string(name))), MTPVector<MTPInputDocument>(), MTPInputPhoto(), MTPint(), MTPint());
++	_transfer.insert(u"state"_q, u"sending"_q); _uploadDeadline.callOnce(30000);
++	_uploadRequest = _api.request(MTPmessages_SendMedia(MTP_flags(_topicId > 1 ? MTPmessages_SendMedia::Flag::f_reply_to : MTPmessages_SendMedia::Flag()), peer()->input(), replyTo(), media, MTP_string(QString()), MTP_long(_fileRandomId), MTPReplyMarkup(), MTPVector<MTPMessageEntity>(), MTPint(), MTPint(), MTPInputPeer(), MTPInputQuickReplyShortcut(), MTPlong(), MTPlong(), MTPSuggestedPost()))
++	.done(crl::guard(this, [=](const MTPUpdates &updates) {
++		_uploadRequest = 0; _uploadDeadline.cancel();
++		if (!_account->sessionExists()) return failUpload(u"LOCKED"_q);
++		_account->session().api().applyUpdates(updates); _transfer.insert(u"state"_q, u"done"_q);
++	})).fail(crl::guard(this, [=](const MTP::Error &) { failUpload(u"SEND_UNCERTAIN"_q); })).handleFloodErrors().send();
++}
++void IcqramChat::download(int messageId, Reply reply) {
++	const auto document = _documents.value(messageId);
++	if (!document || document->forbidsFileSave()) return reply({}, u"FILE_UNAVAILABLE"_q);
++	if (document->loading()) return reply({}, u"BUSY"_q);
++	const auto name = QFileInfo(document->filename()).fileName();
++	const auto path = QFileDialog::getSaveFileName(QApplication::activeWindow(), u"Dosyayı kaydet"_q, QDir(QStandardPaths::writableLocation(QStandardPaths::DownloadLocation)).filePath(name.isEmpty() ? u"dosya"_q : name));
++	if (!_allowed()) return reply({}, u"LOCKED"_q);
++	if (path.isEmpty()) return reply({{u"cancelled"_q, true}}, {});
++	_downloads[messageId] = {document, path, u"downloading"_q};
++	document->save(Data::FileOrigin(FullMsgId(peer()->id, MsgId(messageId))), path);
++	reply({{u"started"_q, true}}, {});
++}
++QString IcqramChat::mediaMime(int messageId) const {
++	const auto document = _documents.value(messageId);
++	if (!peer() || !peer()->allowsForwarding()) return {};
++	if (!document || document->forbidsFileSave() || document->size <= 0
++		|| document->size > qint64(2000) * 1024 * 1024
++		|| !(document->isVideoFile() || document->isVideoMessage()
++			|| document->isAudioFile() || document->isVoiceMessage())) {
++		return {};
++	}
++	const auto mime = document->mimeString().toLower();
++	static const auto allowed = QSet<QString>{
++		u"video/mp4"_q, u"video/quicktime"_q, u"video/webm"_q,
++		u"audio/mpeg"_q, u"audio/mp4"_q, u"audio/aac"_q,
++		u"audio/ogg"_q, u"audio/opus"_q, u"audio/wav"_q,
++		u"audio/x-wav"_q, u"audio/flac"_q, u"audio/webm"_q,
++	};
++	return allowed.contains(mime) ? mime : QString();
++}
++
++bool IcqramChat::canViewMedia(int messageId) const {
++	return _photos.contains(messageId) || !mediaMime(messageId).isEmpty();
++}
++
++void IcqramChat::cancelMedia(int messageId) {
++	if (_photoViews.contains(messageId)) _photoViews[messageId]->owner()->cancel();
++	if (messageId != _playbackId) return;
++	if (_mediaDocument && _mediaDirectory && _mediaDocument->loading()
++		&& _mediaDocument->loadingFilePath() == _mediaDirectory->filePath(u"media"_q)) {
++		_mediaDocument->cancel();
++	}
++	_mediaDocument = nullptr;
++	_playbackId = 0;
++	_playbackStarted = false;
++	_mediaDirectory.reset();
++}
++
++IcqramChat::MediaChunk IcqramChat::mediaChunk(int messageId, qint64 offset, qint64 limit) {
++	if (!_allowed() || messageId != _playbackId || !_mediaDirectory
++		|| mediaMime(messageId).isEmpty() || !_mediaDocument
++		|| _mediaDocument->loading()) return {};
++	auto file = QFile(_mediaDirectory->filePath(u"media"_q));
++	if (!file.open(QIODevice::ReadOnly) || file.size() != _mediaDocument->size
++		|| offset < 0 || offset >= file.size() || !file.seek(offset)) return {};
++	const auto count = std::min(qint64(2 * 1024 * 1024),
++		limit > 0 ? limit : file.size() - offset);
++	return { file.read(count), mediaMime(messageId), file.size() };
++}
++
++void IcqramChat::media(int messageId, bool save, Reply reply) {
++	if (_photos.contains(messageId)) return photo(messageId, save, std::move(reply));
++	const auto document = _documents.value(messageId);
++	const auto mime = mediaMime(messageId);
++	if (mime.isEmpty() || !document || document->size <= 0
++		|| document->size > qint64(2000) * 1024 * 1024) {
++		return reply({}, u"FILE_UNAVAILABLE"_q);
++	}
++	if (_playbackId != messageId) {
++		cancelMedia(_playbackId);
++		if (save) return reply({}, u"MEDIA_NOT_READY"_q);
++		_mediaDirectory = std::make_unique<QTemporaryDir>(QDir::tempPath() + u"/icqram-media-XXXXXX"_q);
++		if (!_mediaDirectory->isValid()) return reply({}, u"FILE_UNAVAILABLE"_q);
++		_playbackId = messageId;
++		_mediaDocument = document;
++	}
++	const auto path = _mediaDirectory->filePath(u"media"_q);
++	const auto complete = !document->loading() && QFileInfo(path).isFile()
++		&& QFileInfo(path).size() == document->size && document->status != FileDownloadFailed;
++	if (!complete) {
++		if (save) return reply({}, u"MEDIA_NOT_READY"_q);
++		if (!document->loading()) {
++			if (_playbackStarted) return reply({}, u"FILE_LOAD_FAILED"_q);
++			const auto storage = QStorageInfo(_mediaDirectory->path());
++			if (storage.isValid() && storage.bytesAvailable() < document->size + 16 * 1024 * 1024) {
++				return reply({}, u"DISK_FULL"_q);
++			}
++			_playbackStarted = true;
++			document->save(Data::FileOrigin(FullMsgId(peer()->id, MsgId(messageId))), path);
++		}
++		return reply({{u"loading"_q,true}, {u"bytes"_q,document->loadOffset()}, {u"size"_q,document->size}}, {});
++	}
++	if (save) {
++		const auto name = QFileInfo(document->filename()).fileName();
++		const auto target = QFileDialog::getSaveFileName(QApplication::activeWindow(),
++			u"Medyayı kaydet"_q, QDir(QStandardPaths::writableLocation(QStandardPaths::DownloadLocation)).filePath(
++				name.isEmpty() ? (document->isVoiceMessage() ? u"sesli-mesaj.ogg"_q : u"medya"_q) : name));
++		if (!_allowed()) return reply({},u"LOCKED"_q);
++		if (target.isEmpty()) return reply({{u"cancelled"_q,true}},{});
++		auto input = QFile(path);
++		auto output = QSaveFile(target);
++		if (!input.open(QIODevice::ReadOnly) || !output.open(QIODevice::WriteOnly)) return reply({},u"FILE_SAVE_FAILED"_q);
++		while (!input.atEnd()) {
++			const auto chunk = input.read(1024 * 1024);
++			if (chunk.isEmpty() || output.write(chunk) != chunk.size()) return reply({},u"FILE_SAVE_FAILED"_q);
++		}
++		return output.commit() ? reply({{u"saved"_q,true}}, {}) : reply({},u"FILE_SAVE_FAILED"_q);
++	}
++	reply({{u"url"_q,u"icqram-ui://domain/media/playback"_q},
++		{u"kind"_q,(document->isVideoFile() || document->isVideoMessage()) ? u"video"_q : u"audio"_q},
++		{u"mime"_q,mime}, {u"name"_q,document->filename()},
++		{u"size"_q,document->size}}, {});
++}
++void IcqramChat::photo(int messageId, bool save, Reply reply) {
++    const auto photo = _photos.value(messageId);
++    if (!peer()->allowsForwarding()) return reply({}, u"FILE_UNAVAILABLE"_q);
++    if (!photo || photo->imageByteSize(Data::PhotoSize::Large) > 32 * 1024 * 1024) return reply({}, u"FILE_UNAVAILABLE"_q);
++    if (!_photoViews.contains(messageId) && _photoViews.size() >= 32) return reply({}, u"MEDIA_LIMIT"_q);
++    auto &media = _photoViews[messageId];
++    if (!media || media->owner() != photo) media = photo->createMediaView();
++    if (!media->loaded()) {
++        if (save) return reply({}, u"MEDIA_NOT_READY"_q);
++        if (!photo->loading()) media->wanted(Data::PhotoSize::Large, Data::FileOrigin(FullMsgId(peer()->id,MsgId(messageId))));
++        return reply({{u"loading"_q,true}, {u"bytes"_q,photo->loadOffset()}, {u"size"_q,photo->imageByteSize(Data::PhotoSize::Large)}}, {});
++    }
++    if (save) {
++        const auto name = u"icqram-photo-"_q + QString::number(messageId) + u".jpg"_q;
++        const auto path = QFileDialog::getSaveFileName(QApplication::activeWindow(),u"Fotoğrafı kaydet"_q,QDir(QStandardPaths::writableLocation(QStandardPaths::DownloadLocation)).filePath(name),u"JPEG (*.jpg *.jpeg)"_q);
++        if (!_allowed()) return reply({},u"LOCKED"_q);
++        if (path.isEmpty()) return reply({{u"cancelled"_q,true}},{});
++        return media->saveToFile(path) ? reply({{u"saved"_q,true}}, {}) : reply({},u"FILE_SAVE_FAILED"_q);
++    }
++    const auto image = media->image(Data::PhotoSize::Large);
++    if (!image) return reply({},u"FILE_UNAVAILABLE"_q);
++    auto bytes = QByteArray(); auto buffer = QBuffer(&bytes); buffer.open(QIODevice::WriteOnly);
++    image->original().scaled(1280,1280,Qt::KeepAspectRatio,Qt::SmoothTransformation).save(&buffer,"JPG",80);
++    reply({{u"url"_q,u"data:image/jpeg;base64,"_q+QString::fromLatin1(bytes.toBase64())}, {u"width"_q,image->original().width()}, {u"height"_q,image->original().height()}},{});
++}
++void IcqramChat::request(const QString &method, const QJsonObject &params, Reply reply) {
++	if (!_allowed()) return reply({}, u"LOCKED"_q);
++	if (!peer()) return reply({}, u"PEER_UNAVAILABLE"_q);
++	if (method == u"chat.commands.refresh"_q) {
++		if (!peer()->isBot()) return reply({}, u"INVALID_REQUEST"_q);
++		_account->session().api().requestFullPeer(peer());
++		return reply(state(), {});
++	}
++	if (method == u"chat.topics"_q) return topics(params.value(u"reset"_q).toBool(), std::move(reply));
++    if (method == u"chat.topic.select"_q) return selectTopic(params.value(u"topicId"_q).toInt(), std::move(reply));
++    // Every topic-dependent action carries its context, so delayed UI work cannot target a different topic.
++    if ((method == u"chat.history"_q || method == u"chat.send"_q || method.startsWith(u"chat.draft."_q) || method == u"chat.read"_q || method == u"chat.typing"_q || method == u"chat.file.choose"_q || method == u"chat.file.send"_q)
++        && params.value(u"topicId"_q).toInt() != _topicId) return reply({}, u"TOPIC_CHANGED"_q);
++    if (method == u"chat.history"_q) {
++		const auto before = params.value(u"before"_q).toInt();
++		if (before < 0) return reply({}, u"INVALID_REQUEST"_q);
++		history(before, std::move(reply));
++	} else if (method == u"chat.send"_q) {
++		send(params, std::move(reply));
++	} else if (method == u"chat.draft.get"_q) {
++        const auto history = _account->session().data().history(peer());
++        const auto draft = history->localDraft(MsgId(_topicId), PeerId());
++        reply({{u"text"_q, draft ? draft->textWithTags.text : QString()}}, {});
++    } else if (method == u"chat.draft.set"_q) {
++        if (!params.value(u"text"_q).isString() || params.value(u"text"_q).toString().size() > 4000) return reply({}, u"INVALID_MESSAGE"_q);
++        saveDraft(params.value(u"text"_q).toString());
++        reply({{u"saved"_q, true}}, {});
++    } else if (method == u"chat.read"_q) {
++        const auto id = params.value(u"messageId"_q).toInt();
++        if (!_knownIncoming.contains(id)) return reply({}, u"INVALID_MESSAGE"_q);
++        if (const auto selected = topic()) selected->replies()->readTill(MsgId(id));
++        else if (!peer()->isForum()) _account->session().data().histories().readInboxTill(_account->session().data().history(peer()), MsgId(id));
++        reply({{u"accepted"_q, true}}, {});
++    } else if (method == u"chat.state"_q) {
++		reply(state(), {});
++	} else if (method == u"chat.block"_q && params.value(u"blocked"_q).isBool()) {
++		block(params.value(u"blocked"_q).toBool(), std::move(reply));
++	} else if (method == u"chat.typing"_q) {
++		const auto active = params.value(u"active"_q).toBool();
++		if (canSend() && !peer()->isBroadcast() && !peer()->isSelf() && !peer()->isBot() && !peer()->isBlocked() && (!active || crl::now() - _typingSentAt > 4500) && (active || _typingSent)) {
++			_typingSent = active; _typingSentAt = crl::now();
++			_api.request(MTPmessages_SetTyping(MTP_flags(_topicId ? MTPmessages_SetTyping::Flag::f_top_msg_id : MTPmessages_SetTyping::Flag()), peer()->input(), MTP_int(_topicId), active ? MTPSendMessageAction(MTP_sendMessageTypingAction()) : MTPSendMessageAction(MTP_sendMessageCancelAction()))).send();
++		}
++		reply({{u"ok"_q, true}}, {});
++	} else if (method == u"chat.media.get"_q || method == u"chat.media.save"_q) {
++		media(params.value(u"messageId"_q).toInt(), method == u"chat.media.save"_q, std::move(reply));
++	} else if (method == u"chat.media.cancel"_q) {
++		cancelMedia(params.value(u"messageId"_q).toInt());
++		reply({{u"cancelled"_q,true}},{});
++	} else if (method == u"chat.photo.get"_q || method == u"chat.photo.save"_q) {
++        photo(params.value(u"messageId"_q).toInt(), method == u"chat.photo.save"_q, std::move(reply));
++    } else if (method == u"chat.photo.cancel"_q) {
++        const auto id = params.value(u"messageId"_q).toInt();
++        if (_photoViews.contains(id)) _photoViews[id]->owner()->cancel();
++        reply({{u"cancelled"_q,true}},{});
++    } else if (method == u"chat.file.choose"_q) {
++		chooseFile(std::move(reply));
++	} else if (method == u"chat.file.send"_q) {
++		startFile(params.value(u"token"_q).toString(), std::move(reply));
++	} else if (method == u"chat.file.download"_q) {
++		download(params.value(u"messageId"_q).toInt(), std::move(reply));
++	} else if (method == u"chat.file.cancel"_q) {
++		const auto messageId = params.value(u"messageId"_q).toInt();
++		if (messageId && _downloads.contains(messageId)) {
++			_downloads[messageId].document->cancel(); _downloads[messageId].state = u"cancelled"_q;
++		} else if (!messageId) {
++			_api.request(base::take(_uploadRequest)).cancel(); _uploadDeadline.cancel();
++			const auto uncertain = _transfer.value(u"state"_q) == u"sending"_q;
++			if (_uploadFile) _uploadFile->close(); _transfer.insert(u"state"_q, uncertain ? u"uncertain"_q : u"cancelled"_q);
++		}
++		reply(state(), {});
++	} else {
++		reply({}, u"UNSUPPORTED_METHOD"_q);
++	}
++}
++void IcqramChat::history(int before, Reply reply) {
++	if (_historyRequest) return reply({}, u"BUSY"_q);
++	_historyReply = std::move(reply);
++	_historyDeadline.callOnce(12000);
++	const auto onDone = crl::guard(this, [=](const MTPmessages_Messages &result) {
++		_historyRequest = 0;
++		_historyDeadline.cancel();
++		auto done = base::take(_historyReply);
++		if (!_allowed() || !peer()) return done({}, u"LOCKED"_q);
++		auto messages = QJsonArray();
++		auto count = 0;
++		auto oldest = 0;
++		const auto consume = [&](const auto &data) {
++			_account->session().data().processUsers(data.vusers());
++			_account->session().data().processChats(data.vchats());
++			for (const auto &message : data.vmessages().v) {
++				++count;
++				message.match([&](const MTPDmessage &m) {
++					const auto id = m.vid().v;
++					if (!m.is_out()) _knownIncoming.insert(id);
++					oldest = oldest ? std::min(oldest, id) : id;
++					auto text = qs(m.vmessage());
++					auto item = QJsonObject{{u"id"_q, id}, {u"date"_q, m.vdate().v}, {u"out"_q, m.is_out()}, {u"text"_q, text}};
++					const auto sender = m.vfrom_id() ? _account->session().data().peerLoaded(peerFromMTP(*m.vfrom_id())) : peer();
++					item.insert(u"sender"_q,sender ? sender->name() : peer()->name());
++					auto commands = QJsonArray();
++					if (m.ventities()) for (const auto &entity : m.ventities()->v) {
++						if (entity.type() != mtpc_messageEntityBotCommand) continue;
++						const auto &command = entity.c_messageEntityBotCommand();
++						commands.push_back(QJsonObject{{u"offset"_q, command.voffset().v}, {u"length"_q, command.vlength().v}});
++					}
++					item.insert(u"commands"_q, commands);
++					_documents.remove(id); _photos.remove(id);
++					if (peer()->allowsForwarding() && !m.is_noforwards() && m.vmedia() && m.vmedia()->type() == mtpc_messageMediaDocument && m.vmedia()->c_messageMediaDocument().vdocument() && m.vmedia()->c_messageMediaDocument().vdocument()->type() == mtpc_document && !m.vmedia()->c_messageMediaDocument().vttl_seconds()) {
++						const auto document = _account->session().data().processDocument(*m.vmedia()->c_messageMediaDocument().vdocument());
++						_documents[id] = document;
++						item.insert(u"file"_q, QJsonObject{{u"name"_q, document->filename()}, {u"size"_q, document->size}, {u"playable"_q,!mediaMime(id).isEmpty()}, {u"kind"_q, document->isVoiceMessage() ? u"voice"_q : (document->isVideoFile() || document->isVideoMessage()) ? u"video"_q : document->isAudioFile() ? u"audio"_q : u"file"_q}});
++					 } else if (peer()->allowsForwarding() && !m.is_noforwards() && m.vmedia() && m.vmedia()->type() == mtpc_messageMediaPhoto && m.vmedia()->c_messageMediaPhoto().vphoto() && m.vmedia()->c_messageMediaPhoto().vphoto()->type() == mtpc_photo && !m.vmedia()->c_messageMediaPhoto().vttl_seconds()) {
++                        _photos[id] = _account->session().data().processPhoto(*m.vmedia()->c_messageMediaPhoto().vphoto());
++                        item.insert(u"photo"_q,true);
++                    } else if (m.vmedia() && m.vmedia()->type() != mtpc_messageMediaEmpty && m.vmedia()->type() != mtpc_messageMediaWebPage) {
++						text += (text.isEmpty() ? QString() : u"\n"_q) + u"[Ek — Telegram’da görüntüleyebilirsin]"_q;
++					}
++					item.insert(u"text"_q, text); messages.push_back(item);
++				}, [&](const MTPDmessageService &m) {
++					const auto id = m.vid().v;
++					if (!m.is_out()) _knownIncoming.insert(id);
++					oldest = oldest ? std::min(oldest, id) : id;
++					messages.push_back(QJsonObject{{u"id"_q, id}, {u"date"_q, m.vdate().v}, {u"out"_q, m.is_out()}, {u"text"_q, u"Telegram hizmet bildirimi"_q}});
++				}, [&](const MTPDmessageEmpty &m) {
++					oldest = oldest ? std::min(oldest, m.vid().v) : m.vid().v;
++				});
++			}
++		};
++		result.match([&](const MTPDmessages_messages &d) { consume(d); }, [&](const MTPDmessages_messagesSlice &d) { consume(d); }, [&](const MTPDmessages_channelMessages &d) { consume(d); }, [&](const MTPDmessages_messagesNotModified &) {});
++		const auto user = peer();
++		user->loadUserpic();
++		_awaitingPhoto = user->hasUserpic() && user->useEmptyUserpic(_userpic);
++		auto bytes = QByteArray();
++		auto buffer = QBuffer(&bytes);
++		buffer.open(QIODevice::WriteOnly);
++		const auto avatar = PeerData::GenerateUserpicImage(user, _userpic, 64, 0);
++		avatar.save(&buffer, "PNG");
++		const auto avatarUrl = u"data:image/png;base64,"_q + QString::fromLatin1(bytes.toBase64());
++		auto peerState = state(); peerState.insert(u"avatar"_q, avatarUrl);
++		done({{u"messages"_q, messages}, {u"oldest"_q, oldest}, {u"hasMore"_q, count == 50}, {u"peer"_q, peerState}}, {});
++	});
++	const auto onFail = crl::guard(this, [=](const MTP::Error &error) {
++		_historyRequest = 0;
++		_historyDeadline.cancel();
++		if (auto done = base::take(_historyReply)) done({}, MTP::IsFloodError(error) ? u"FLOOD_WAIT"_q : u"HISTORY_UNAVAILABLE"_q);
++	});
++    if (peer()->isForum() && !_topicId) {
++        _historyDeadline.cancel(); auto done = base::take(_historyReply);
++        return done({{u"messages"_q,QJsonArray()}, {u"oldest"_q,0}, {u"hasMore"_q,false}, {u"peer"_q,state()}}, {});
++    }
++    if (_topicId) _historyRequest = _api.request(MTPmessages_GetReplies(peer()->input(), MTP_int(_topicId), MTP_int(before), MTP_int(0), MTP_int(0), MTP_int(50), MTP_int(0), MTP_int(0), MTP_long(0))).done(onDone).fail(onFail).handleFloodErrors().send();
++    else _historyRequest = _api.request(MTPmessages_GetHistory(peer()->input(), MTP_int(before), MTP_int(0), MTP_int(0), MTP_int(50), MTP_int(0), MTP_int(0), MTP_long(0))).done(onDone).fail(onFail).handleFloodErrors().send();
++}
++void IcqramChat::send(const QJsonObject &params, Reply reply) {
++	if (!canSend()) return reply({}, u"CHAT_READ_ONLY"_q);
++	if (peer()->isBlocked()) return reply({}, u"PEER_BLOCKED"_q);
++	if (_sendRequest) return reply({}, u"BUSY"_q);
++	if (crl::now() < _retrySendAt) return reply({}, u"FLOOD_WAIT"_q);
++	const auto text = params.value(u"text"_q).toString();
++	const auto nonce = params.value(u"nonce"_q).toString();
++	static const auto validNonce = QRegularExpression(u"^[a-zA-Z0-9-]{16,64}$"_q);
++	if (text.trimmed().isEmpty() || text.size() > 4000 || !validNonce.match(nonce).hasMatch()) return reply({}, u"INVALID_MESSAGE"_q);
++	if (!_attempts.contains(nonce)) {
++		if (_attempts.size() >= 2048) return reply({}, u"SESSION_SEND_LIMIT"_q);
++		_attempts.insert(nonce, Attempt{ text, base::RandomValue<uint64>(), {}, _topicId });
++	}
++	const auto &attempt = _attempts[nonce];
++	if (attempt.text != text || attempt.topicId != _topicId) return reply({}, u"NONCE_CONFLICT"_q);
++	if (!attempt.result.isEmpty()) return reply(attempt.result, {});
++	_sendReply = std::move(reply);
++	_sendDeadline.callOnce(12000);
++	// The same nonce always reuses Telegram's random_id, including timeout retries.
++	_sendRequest = _api.request(MTPmessages_SendMessage(
++		MTP_flags(MTPmessages_SendMessage::Flag::f_no_webpage | (_topicId > 1 ? MTPmessages_SendMessage::Flag::f_reply_to : MTPmessages_SendMessage::Flag())), peer()->input(), replyTo(), MTP_string(text), MTP_long(attempt.randomId), MTPReplyMarkup(), MTPVector<MTPMessageEntity>(), MTPint(), MTPint(), MTPInputPeer(), MTPInputQuickReplyShortcut(), MTPlong(), MTPlong(), MTPSuggestedPost(), MTPInputRichMessage()))
++	.done(crl::guard(this, [=](const MTPUpdates &updates) {
++		_sendRequest = 0;
++		_sendDeadline.cancel();
++		auto done = base::take(_sendReply);
++		if (!_account->sessionExists()) return done({}, u"LOCKED"_q);
++		auto result = QJsonObject{{u"sent"_q, true}};
++		if (updates.type() == mtpc_updateShortSentMessage) result.insert(u"id"_q, updates.c_updateShortSentMessage().vid().v);
++		_attempts[nonce].result = result;
++        if (!params.value(u"preserveDraft"_q).toBool()) {
++            const auto draft = _account->session().data().history(peer())->localDraft(MsgId(_topicId), PeerId());
++            if (draft && draft->textWithTags.text.trimmed() == text) saveDraft(QString());
++        }
++		_account->session().api().applyUpdates(updates);
++		done(_allowed() ? result : QJsonObject(), _allowed() ? QString() : u"SEND_UNCERTAIN"_q);
++	})).fail(crl::guard(this, [=](const MTP::Error &error) {
++		_sendRequest = 0;
++		_sendDeadline.cancel();
++		if (MTP::IsFloodError(error)) {
++			const auto seconds = error.type().section('_', -1).toInt();
++			_retrySendAt = crl::now() + std::clamp(seconds, 30, 86400) * crl::time(1000);
++		}
++		if (auto done = base::take(_sendReply)) done({}, MTP::IsFloodError(error) ? u"FLOOD_WAIT"_q : (error.type() == u"RANDOM_ID_DUPLICATE"_q ? u"SEND_UNCERTAIN"_q : u"SEND_FAILED"_q));
++	})).handleFloodErrors().send();
++}
++}
+diff --git a/Telegram/SourceFiles/api/api_icqram_chat.h b/Telegram/SourceFiles/api/api_icqram_chat.h
+new file mode 100644
+index 0000000000..6068c16206
+--- /dev/null
++++ b/Telegram/SourceFiles/api/api_icqram_chat.h
+@@ -0,0 +1,104 @@
++#pragma once
++
++#include "base/timer.h"
++#include "mtproto/sender.h"
++#include "ui/userpic_view.h"
++#include <QtCore/QObject>
++#include <QtCore/QJsonObject>
++#include <QtCore/QMap>
++#include <QtCore/QSet>
++
++namespace Main { class Account; }
++class PeerData;
++class DocumentData;
++class PhotoData;
++namespace Data { class PhotoMedia; class ForumTopic; }
++class QFile;
++class QCryptographicHash;
++class QTemporaryDir;
++namespace Api {
++class IcqramChat final : public QObject {
++public:
++	using Reply = Fn<void(QJsonObject, QString)>;
++	IcqramChat(not_null<Main::Account*> account, QString peerId, Fn<bool()> allowed, Fn<void()> changed);
++	~IcqramChat();
++	void request(const QString &method, const QJsonObject &params, Reply reply);
++	bool canViewMedia(int messageId) const;
++	int currentTopicId() const { return _topicId; }
++	struct MediaChunk { QByteArray bytes; QString mime; qint64 total = 0; };
++	MediaChunk mediaChunk(int messageId, qint64 offset, qint64 limit);
++	void cancelMedia(int messageId);
++private:
++	PeerData *peer() const;
++	Data::ForumTopic *topic() const;
++	bool canSend(bool files = false) const;
++	MTPInputReplyTo replyTo() const;
++	void topics(bool reset, Reply reply);
++	void selectTopic(int id, Reply reply);
++	int _topicId = 0;
++	QSet<int> _topicIds;
++	int _topicOffsetDate = 0, _topicOffsetId = 0, _topicOffsetTopic = 0;
++	bool _topicsComplete = false;
++	mtpRequestId _topicsRequest = 0;
++	Reply _topicsReply;
++	base::Timer _topicsDeadline;
++	void history(int before, Reply reply);
++	void send(const QJsonObject &params, Reply reply);
++	QJsonObject state();
++	void block(bool blocked, Reply reply);
++	void chooseFile(Reply reply);
++	void saveDraft(const QString &text);
++	void photo(int messageId, bool save, Reply reply);
++	void media(int messageId, bool save, Reply reply);
++	QString mediaMime(int messageId) const;
++	std::unique_ptr<QTemporaryDir> _mediaDirectory;
++	DocumentData *_mediaDocument = nullptr;
++	int _playbackId = 0;
++	bool _playbackStarted = false;
++	QMap<int, PhotoData*> _photos;
++	QMap<int, std::shared_ptr<Data::PhotoMedia>> _photoViews;
++	QSet<int> _knownIncoming;
++	void startFile(const QString &token, Reply reply);
++	void uploadPart();
++	void finishUpload();
++	void failUpload(QString error);
++	void download(int messageId, Reply reply);
++	QMap<int, DocumentData*> _documents;
++	struct Download { DocumentData *document = nullptr; QString path; QString state; };
++	QMap<int, Download> _downloads;
++	QString _selectedFile, _fileToken;
++	std::unique_ptr<QFile> _uploadFile;
++	std::unique_ptr<QCryptographicHash> _fileHash;
++	QJsonObject _transfer;
++	uint64 _uploadId = 0, _fileRandomId = 0;
++	int _part = 0, _parts = 0;
++	mtpRequestId _uploadRequest = 0, _blockRequest = 0;
++	base::Timer _uploadDeadline;
++	base::Timer _blockDeadline;
++	Reply _blockReply;
++	crl::time _typingSentAt = 0;
++	bool _typingSent = false;
++	const not_null<Main::Account*> _account;
++	const QString _peerId;
++	Fn<bool()> _allowed;
++	MTP::Sender _api;
++	base::Timer _historyDeadline;
++	base::Timer _sendDeadline;
++	mtpRequestId _historyRequest = 0;
++	mtpRequestId _sendRequest = 0;
++	Reply _historyReply;
++	Reply _sendReply;
++	crl::time _retrySendAt = 0;
++	struct Attempt {
++		QString text;
++		uint64 randomId = 0;
++		QJsonObject result;
++		int topicId = 0;
++	};
++	QMap<QString, Attempt> _attempts;
++	Ui::PeerUserpicView _userpic;
++	bool _awaitingPhoto = false;
++	rpl::lifetime _lifetime;
++
++};
++}
+diff --git a/Telegram/SourceFiles/core/application.cpp b/Telegram/SourceFiles/core/application.cpp
+index 94b64dc33f..b417d8c1a0 100644
+--- a/Telegram/SourceFiles/core/application.cpp
++++ b/Telegram/SourceFiles/core/application.cpp
+@@ -2181,42 +2181,7 @@ void Application::startShortcuts() {
+ }
+ 
+ void Application::RegisterUrlScheme() {
+-	const auto arguments = Launcher::Instance().customWorkingDir()
+-		? u"-workdir \"%1\""_q.arg(cWorkingDir())
+-		: QString();
+-
+-	base::Platform::RegisterUrlScheme(base::Platform::UrlSchemeDescriptor{
+-		.executable = Platform::ExecutablePathForShortcuts(),
+-		.arguments = arguments,
+-		.protocol = u"tg"_q,
+-		.protocolName = u"Telegram Link"_q,
+-		.shortAppName = u"tdesktop"_q,
+-		.longAppName = QCoreApplication::applicationName(),
+-		.displayAppName = AppName.utf16(),
+-		.displayAppDescription = AppName.utf16(),
+-	});
+-
+-	base::Platform::RegisterUrlScheme(base::Platform::UrlSchemeDescriptor{
+-		.executable = Platform::ExecutablePathForShortcuts(),
+-		.arguments = arguments,
+-		.protocol = u"tonsite"_q,
+-		.protocolName = u"TonSite Link"_q,
+-		.shortAppName = u"tdesktop"_q,
+-		.longAppName = QCoreApplication::applicationName(),
+-		.displayAppName = AppName.utf16(),
+-		.displayAppDescription = AppName.utf16(),
+-	});
+-
+-	base::Platform::RegisterUrlScheme(base::Platform::UrlSchemeDescriptor{
+-		.executable = Platform::ExecutablePathForShortcuts(),
+-		.arguments = arguments,
+-		.protocol = u"ton"_q,
+-		.protocolName = u"Ton Link"_q,
+-		.shortAppName = u"tdesktop"_q,
+-		.longAppName = QCoreApplication::applicationName(),
+-		.displayAppName = AppName.utf16(),
+-		.displayAppDescription = AppName.utf16(),
+-	});
++	// Keep existing Telegram and TON link handlers owned by their applications.
+ }
+ 
+ bool IsAppLaunched() {
+diff --git a/Telegram/SourceFiles/core/launcher.cpp b/Telegram/SourceFiles/core/launcher.cpp
+index 3e436f7087..146329869e 100644
+--- a/Telegram/SourceFiles/core/launcher.cpp
++++ b/Telegram/SourceFiles/core/launcher.cpp
+@@ -221,7 +221,7 @@ void ComputeInstallationTag() {
+ 
+ bool MoveLegacyAlphaFolder(const QString &folder, const QString &file) {
+ 	const auto was = cExeDir() + folder;
+-	const auto now = cExeDir() + u"TelegramForcePortable"_q;
++	const auto now = cExeDir() + u"icqramForcePortable"_q;
+ 	if (QDir(was).exists() && !QDir(now).exists()) {
+ 		const auto oldFile = was + "/tdata/" + file;
+ 		const auto newFile = was + "/tdata/alpha";
+@@ -242,8 +242,8 @@ bool MoveLegacyAlphaFolder(const QString &folder, const QString &file) {
+ }
+ 
+ bool MoveLegacyAlphaFolder() {
+-	if (!MoveLegacyAlphaFolder(u"TelegramAlpha_data"_q, u"alpha"_q)
+-		|| !MoveLegacyAlphaFolder(u"TelegramBeta_data"_q, u"beta"_q)) {
++	if (!MoveLegacyAlphaFolder(u"icqramAlpha_data"_q, u"alpha"_q)
++		|| !MoveLegacyAlphaFolder(u"icqramBeta_data"_q, u"beta"_q)) {
+ 		return false;
+ 	}
+ 	return true;
+@@ -254,7 +254,7 @@ bool CheckPortableVersionFolder() {
+ 		return false;
+ 	}
+ 
+-	const auto portable = cExeDir() + u"TelegramForcePortable"_q;
++	const auto portable = cExeDir() + u"icqramForcePortable"_q;
+ 	QFile key(portable + u"/tdata/alpha"_q);
+ 	if (cAlphaVersion()) {
+ 		Assert(*AlphaPrivateKey != 0);
+@@ -343,7 +343,7 @@ void Launcher::init() {
+ 	prepareSettings();
+ 	initQtMessageLogging();
+ 
+-	QApplication::setApplicationName(u"TelegramDesktop"_q);
++	QApplication::setApplicationName(u"icqram"_q);
+ 
+ #if QT_VERSION < QT_VERSION_CHECK(6, 0, 0)
+ 	// fallback session management is useless for tdesktop since it doesn't have
+@@ -391,7 +391,7 @@ int Launcher::exec() {
+ 	}
+ 
+ 	// Before Logs::start(), which is where the working directory gets
+-	// chosen: a translocated bundle never sees its TelegramForcePortable.
++	// chosen: a translocated bundle never sees its icqramForcePortable.
+ 	if (!Platform::CheckAppTranslocation()) {
+ 		return 0;
+ 	}
+diff --git a/Telegram/SourceFiles/core/version.h b/Telegram/SourceFiles/core/version.h
+index a1a1aafa1b..26074e175d 100644
+--- a/Telegram/SourceFiles/core/version.h
++++ b/Telegram/SourceFiles/core/version.h
+@@ -18,10 +18,10 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
+ #endif // TDESKTOP_ALLOW_CLOSED_ALPHA
+ 
+ // used in Updater.cpp and Setup.iss for Windows
+-constexpr auto AppId = "{53F49750-6209-4FBF-9CA8-7A333C87D1ED}"_cs;
+-constexpr auto AppNameOld = "Telegram Win (Unofficial)"_cs;
+-constexpr auto AppName = "Telegram Desktop"_cs;
+-constexpr auto AppFile = "Telegram"_cs;
++constexpr auto AppId = "{9073565D-E125-4690-BE82-C0E21EF728D1}"_cs;
++constexpr auto AppNameOld = "icqram"_cs;
++constexpr auto AppName = "icqram"_cs;
++constexpr auto AppFile = "icqram"_cs;
+ constexpr auto AppVersion = 7004004;
+ constexpr auto AppVersionStr = "7.4.4";
+ constexpr auto AppBetaVersion = false;
+diff --git a/Telegram/SourceFiles/intro/intro_icqram_auth.cpp b/Telegram/SourceFiles/intro/intro_icqram_auth.cpp
+new file mode 100644
+index 0000000000..08fe739ce1
+--- /dev/null
++++ b/Telegram/SourceFiles/intro/intro_icqram_auth.cpp
+@@ -0,0 +1,194 @@
++#include "intro/intro_icqram_auth.h"
++
++#include "intro/intro_widget.h"
++#include "main/main_account.h"
++#include "core/core_cloud_password.h"
++#include "base/random.h"
++#include <QtCore/QRegularExpression>
++
++namespace Intro {
++
++IcqramAuth::IcqramAuth(QWidget *parent, not_null<Main::Account*> account, not_null<details::Data*> data)
++: Step(parent, account, data)
++, _deadline([=] {
++	apiClear();
++	complete(u"TIMEOUT"_q);
++}) {
++}
++
++IcqramAuth::~IcqramAuth() {
++	_deadline.cancel();
++	clearPassword();
++	apiClear();
++}
++
++QJsonObject IcqramAuth::state() const {
++	return { { u"auth"_q, _state }, { u"connected"_q, false }, { u"codeLength"_q, _codeLength } };
++}
++
++void IcqramAuth::clearPassword() {
++	_password.fill('\0');
++	_password.clear();
++}
++
++void IcqramAuth::complete(QString error) {
++	_deadline.cancel();
++	clearPassword();
++	if (const auto reply = base::take(_reply)) {
++		reply(state(), std::move(error));
++	}
++}
++
++void IcqramAuth::request(const QString &method, const QJsonObject &params, Reply reply) {
++	if (method == u"auth.reset"_q) {
++		apiClear();
++		complete(u"CANCELLED"_q);
++		_phone.clear();
++		_phoneHash.clear();
++		_state = u"phone"_q;
++		_codeLength = 0;
++		reply(state(), {});
++		return;
++	}
++	if (_reply) {
++		reply({}, u"BUSY"_q);
++		return;
++	}
++	if (crl::now() < _retryAfter) {
++		reply({}, u"FLOOD_WAIT"_q);
++		return;
++	}
++	if (method != u"auth."_q + _state) {
++		reply({}, u"AUTH_STATE_INVALID"_q);
++		return;
++	}
++	_reply = std::move(reply);
++	_deadline.callOnce(12000);
++	if (_state == u"phone"_q) {
++		const auto phone = params.value(u"phone"_q).toString();
++		if (!QRegularExpression(u"^\\+[1-9][0-9]{6,14}$"_q).match(phone).hasMatch()) {
++			return complete(u"PHONE_NUMBER_INVALID"_q);
++		}
++		_phone = phone;
++		sendPhone();
++	} else if (_state == u"code"_q) {
++		const auto code = params.value(u"code"_q).toString();
++		if (_phoneHash.isEmpty() || code.size() != _codeLength
++			|| !QRegularExpression(u"^[0-9]+$"_q).match(code).hasMatch()) {
++			return complete(u"PHONE_CODE_INVALID"_q);
++		}
++		sendCode(code);
++	} else {
++		const auto password = params.value(u"password"_q).toString();
++		if (password.isEmpty() || password.size() > 1024) {
++			return complete(u"PASSWORD_HASH_INVALID"_q);
++		}
++		_password = password.toUtf8();
++		sendPassword();
++	}
++}
++
++void IcqramAuth::sendPhone() {
++	api().instance().setUserPhone(_phone);
++	api().request(MTPauth_SendCode(
++		MTP_string(_phone), MTP_int(ApiId), MTP_string(ApiHash),
++		MTP_codeSettings(MTP_flags(0), MTPVector<MTPbytes>(), MTPstring(), MTPBool())
++	)).done(crl::guard(this, [=](const MTPauth_SentCode &result) {
++		sentCode(result);
++	})).fail(crl::guard(this, [=](const MTP::Error &error) {
++		failed(error);
++	})).handleFloodErrors().send();
++}
++
++void IcqramAuth::sentCode(const MTPauth_SentCode &result) {
++	result.match([&](const MTPDauth_sentCode &data) {
++		_emailCode = false;
++		const auto &type = data.vtype();
++		switch (type.type()) {
++		case mtpc_auth_sentCodeTypeApp: _codeLength = type.c_auth_sentCodeTypeApp().vlength().v; break;
++		case mtpc_auth_sentCodeTypeSms: _codeLength = type.c_auth_sentCodeTypeSms().vlength().v; break;
++		case mtpc_auth_sentCodeTypeCall: _codeLength = type.c_auth_sentCodeTypeCall().vlength().v; break;
++		case mtpc_auth_sentCodeTypeEmailCode:
++			_codeLength = type.c_auth_sentCodeTypeEmailCode().vlength().v;
++			_emailCode = true;
++			break;
++		default: return complete(u"AUTH_METHOD_UNSUPPORTED"_q);
++		}
++		if (_codeLength < 1 || _codeLength > 12) {
++			return complete(u"AUTH_METHOD_UNSUPPORTED"_q);
++		}
++		_phoneHash = qba(data.vphone_code_hash());
++		_state = u"code"_q;
++		complete();
++	}, [&](const MTPDauth_sentCodeSuccess &data) {
++		authorized(data.vauthorization());
++	}, [&](const MTPDauth_sentCodePaymentRequired &) {
++		complete(u"AUTH_PAYMENT_REQUIRED"_q);
++	});
++}
++
++void IcqramAuth::sendCode(const QString &code) {
++	api().request(MTPauth_SignIn(
++		MTP_flags(_emailCode ? MTPauth_SignIn::Flag::f_email_verification : MTPauth_SignIn::Flag::f_phone_code),
++		MTP_string(_phone), MTP_bytes(_phoneHash), MTP_string(code),
++		MTP_emailVerificationCode(MTP_string(_emailCode ? code : QString()))
++	)).done(crl::guard(this, [=](const MTPauth_Authorization &result) {
++		authorized(result);
++	})).fail(crl::guard(this, [=](const MTP::Error &error) {
++		if (error.type() == u"SESSION_PASSWORD_NEEDED"_q) {
++			_state = u"password"_q;
++			complete();
++		} else {
++			failed(error);
++		}
++	})).handleFloodErrors().send();
++}
++
++void IcqramAuth::sendPassword() {
++	api().request(MTPaccount_GetPassword()).done(crl::guard(this, [=](const MTPaccount_Password &result) {
++		const auto &data = result.data();
++		base::RandomAddSeed(bytes::make_span(data.vsecure_random().v));
++		const auto state = Core::ParseCloudPasswordState(data);
++		if (!state.mtp.request || !state.mtp.request.id) {
++			return complete(u"AUTH_METHOD_UNSUPPORTED"_q);
++		}
++		auto hash = Core::ComputeCloudPasswordHash(state.mtp.request.algo, bytes::make_span(_password));
++		clearPassword();
++		const auto check = Core::ComputeCloudPasswordCheck(state.mtp.request, hash);
++		std::fill(hash.begin(), hash.end(), std::byte{0});
++		if (!check) {
++			return complete(u"PASSWORD_CHECK_FAILED"_q);
++		}
++		api().request(MTPauth_CheckPassword(check.result)).done(crl::guard(this, [=](const MTPauth_Authorization &auth) {
++			authorized(auth);
++		})).fail(crl::guard(this, [=](const MTP::Error &error) {
++			failed(error);
++		})).handleFloodErrors().send();
++	})).fail(crl::guard(this, [=](const MTP::Error &error) {
++		failed(error);
++	})).handleFloodErrors().send();
++}
++
++void IcqramAuth::authorized(const MTPauth_Authorization &result) {
++	clearPassword();
++	if (result.type() != mtpc_auth_authorization) {
++		return complete(u"SIGNUP_REQUIRED"_q);
++	}
++	const auto &user = result.c_auth_authorization().vuser();
++	if (user.type() != mtpc_user || !user.c_user().is_self() || !user.c_user().vid().v) {
++		return complete(u"AUTH_RESULT_INVALID"_q);
++	}
++	finish(result);
++}
++
++void IcqramAuth::failed(const MTP::Error &error) {
++	const auto type = error.type();
++	if (MTP::IsFloodError(error)) {
++		const auto seconds = std::clamp(type.section('_', -1).toInt(), 1, 86400);
++		_retryAfter = crl::now() + crl::time(seconds) * 1000;
++		return complete(u"FLOOD_WAIT"_q);
++	}
++	complete(MTP::IgnoreError(error) ? u"SILENT"_q : type);
++}
++
++} // namespace Intro
+diff --git a/Telegram/SourceFiles/intro/intro_icqram_auth.h b/Telegram/SourceFiles/intro/intro_icqram_auth.h
+new file mode 100644
+index 0000000000..ca710d2dd2
+--- /dev/null
++++ b/Telegram/SourceFiles/intro/intro_icqram_auth.h
+@@ -0,0 +1,39 @@
++#pragma once
++
++#include "intro/intro_step.h"
++#include "base/timer.h"
++#include <QtCore/QJsonObject>
++
++namespace Intro {
++
++class IcqramAuth final : public details::Step {
++public:
++	using Reply = Fn<void(QJsonObject, QString)>;
++	IcqramAuth(QWidget *parent, not_null<Main::Account*> account, not_null<details::Data*> data);
++	~IcqramAuth();
++	void submit() override {}
++	void request(const QString &method, const QJsonObject &params, Reply reply);
++	[[nodiscard]] QJsonObject state() const;
++
++private:
++	void sentCode(const MTPauth_SentCode &result);
++	void authorized(const MTPauth_Authorization &result);
++	void failed(const MTP::Error &error);
++	void complete(QString error = {});
++	void clearPassword();
++	void sendPhone();
++	void sendCode(const QString &code);
++	void sendPassword();
++
++	QString _state = u"phone"_q;
++	QString _phone;
++	QByteArray _phoneHash;
++	QByteArray _password;
++	int _codeLength = 0;
++	bool _emailCode = false;
++	Reply _reply;
++	base::Timer _deadline;
++	crl::time _retryAfter = 0;
++};
++
++} // namespace Intro
+diff --git a/Telegram/SourceFiles/mainwindow.cpp b/Telegram/SourceFiles/mainwindow.cpp
+index a140f67faf..b349578ccf 100644
+--- a/Telegram/SourceFiles/mainwindow.cpp
++++ b/Telegram/SourceFiles/mainwindow.cpp
+@@ -7,6 +7,10 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
+ */
+ #include "mainwindow.h"
+ 
++#ifdef ICQRAM_SHELL
++#include "window/window_icqram_shell.h"
++#endif
++
+ #include "data/data_document.h"
+ #include "data/data_session.h"
+ #include "data/data_document_media.h"
+@@ -150,6 +154,12 @@ void MainWindow::finishFirstShow() {
+ 	}, lifetime());
+ 
+ 	setAttribute(Qt::WA_NoSystemBackground);
++#ifdef ICQRAM_SHELL
++	if (_icqram && !_passcodeLock && !_setupEmailLock) {
++		_icqram->focus();
++		return;
++	}
++#endif
+ 
+ 	if (!_passcodeLock && !_setupEmailLock && _main) {
+ 		_main->activate();
+@@ -159,6 +169,10 @@ void MainWindow::finishFirstShow() {
+ }
+ 
+ void MainWindow::clearWidgetsHook() {
++#ifdef ICQRAM_SHELL
++	_icqram.destroy();
++	setAttribute(Qt::WA_DontShowOnScreen, false);
++#endif
+ 	_mediaPreview.destroy();
+ 	_main.destroy();
+ 	_intro.destroy();
+@@ -299,6 +313,10 @@ void MainWindow::setupIntro(
+ 
+ 	clearWidgets();
+ 	_intro = std::move(created);
++#ifdef ICQRAM_SHELL
++	_icqram.create(nullptr, &account(), &controller());
++	setAttribute(Qt::WA_DontShowOnScreen, true);
++#endif
+ 	DragArea::SetupProxyDropArea(_intro.data(), [](const QString &localUrl) {
+ 		Core::App().openLocalUrl(localUrl, {});
+ 	});
+@@ -339,6 +357,10 @@ void MainWindow::setupMain(
+ 	auto created = object_ptr<MainWidget>(bodyWidget(), sessionController());
+ 	clearWidgets();
+ 	_main = std::move(created);
++#ifdef ICQRAM_SHELL
++	_icqram.create(nullptr, &account(), &controller());
++	setAttribute(Qt::WA_DontShowOnScreen, true);
++#endif
+ 	updateControlsGeometry();
+ 	Ui::SendPendingMoveResizeEvents(_main);
+ 	_main->controller()->showByInitialId(
+@@ -636,6 +658,10 @@ void MainWindow::setInnerFocus() {
+ 		_passcodeLock->setInnerFocus();
+ 	} else if (_setupEmailLock) {
+ 		_setupEmailLock->setInnerFocus();
++#ifdef ICQRAM_SHELL
++	} else if (_icqram) {
++		_icqram->focus();
++#endif
+ 	} else if (_main) {
+ 		_main->setInnerFocus();
+ 	} else if (_intro) {
+@@ -718,7 +744,37 @@ bool MainWindow::takeThirdSectionFromLayer() {
+ 	return _layer ? _layer->takeToThirdSection() : false;
+ }
+ 
++#ifdef ICQRAM_SHELL
++bool MainWindow::showIcqramAbout() {
++	if (!_icqram || _setupEmailLock || _passcodeLock || ui_isLayerShown()) return false;
++	_icqram->showAbout();
++	return true;
++}
++
++void MainWindow::syncIcqramVisibility() {
++	if (!_icqram) return;
++	const auto locked = bool(_setupEmailLock) || bool(_passcodeLock) || ui_isLayerShown();
++	_icqram->setLocked(locked);
++	if (testAttribute(Qt::WA_DontShowOnScreen) == locked) {
++		if (locked) {
++			setAttribute(Qt::WA_DontShowOnScreen, false);
++			show();
++			raise();
++		} else {
++			hide();
++			setAttribute(Qt::WA_DontShowOnScreen, true);
++			_icqram->focus();
++		}
++	}
++}
++#endif
++
+ void MainWindow::fixOrder() {
++#ifdef ICQRAM_SHELL
++	if (_icqram) {
++		syncIcqramVisibility();
++	}
++#endif
+ 	if (_setupEmailLock) _setupEmailLock->raise();
+ 	if (_passcodeLock) _passcodeLock->raise();
+ 	if (_layer) _layer->raise();
+@@ -760,6 +816,11 @@ void MainWindow::updateControlsGeometry() {
+ 	Platform::MainWindow::updateControlsGeometry();
+ 
+ 	auto body = bodyWidget()->rect();
++#ifdef ICQRAM_SHELL
++	if (_icqram) {
++		syncIcqramVisibility();
++	}
++#endif
+ 	if (_passcodeLock) _passcodeLock->setGeometry(body);
+ 	if (_setupEmailLock) _setupEmailLock->setGeometry(body);
+ 	auto mainLeft = 0;
+diff --git a/Telegram/SourceFiles/mainwindow.h b/Telegram/SourceFiles/mainwindow.h
+index 3cbce82e67..e12ce0a435 100644
+--- a/Telegram/SourceFiles/mainwindow.h
++++ b/Telegram/SourceFiles/mainwindow.h
+@@ -25,6 +25,7 @@ enum class EnterPoint : uchar;
+ 
+ namespace Window {
+ class MediaPreviewWidget;
++class IcqramShell;
+ class SectionMemento;
+ struct SectionShow;
+ class PasscodeLockWidget;
+@@ -65,6 +66,9 @@ public:
+ 	void setupMain(MsgId singlePeerShowAtMsgId, QPixmap oldContentCache);
+ 
+ 	void showSettings();
++#ifdef ICQRAM_SHELL
++	bool showIcqramAbout();
++#endif
+ 
+ 	void setInnerFocus() override;
+ 
+@@ -130,6 +134,9 @@ protected:
+ 	void clearWidgetsHook() override;
+ 
+ private:
++#ifdef ICQRAM_SHELL
++	void syncIcqramVisibility();
++#endif
+ 	void applyInitialWorkMode();
+ 	void ensureLayerCreated();
+ 	void destroyLayer();
+@@ -137,6 +144,10 @@ private:
+ 
+ 	void themeUpdated(const Window::Theme::BackgroundUpdate &data);
+ 
++#ifdef ICQRAM_SHELL
++	object_ptr<Window::IcqramShell> _icqram = { nullptr };
++#endif
++
+ 	QPoint _lastMousePosition;
+ 
+ 	object_ptr<Window::PasscodeLockWidget> _passcodeLock = { nullptr };
+diff --git a/Telegram/SourceFiles/platform/mac/global_menu_mac.mm b/Telegram/SourceFiles/platform/mac/global_menu_mac.mm
+index 761e823945..8ce2fc65e8 100644
+--- a/Telegram/SourceFiles/platform/mac/global_menu_mac.mm
++++ b/Telegram/SourceFiles/platform/mac/global_menu_mac.mm
+@@ -6,6 +6,9 @@
+ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
+ */
+ #include "platform/mac/global_menu_mac.h"
++#ifdef ICQRAM_SHELL
++#include "window/window_icqram_shell.h"
++#endif
+ 
+ #include "core/application.h"
+ #include "core/sandbox.h"
+@@ -421,6 +424,11 @@ void ForceDisabled(QAction *action, bool disabled) {
+ void Manager::buildAppleMenu(QMenu *main) {
+ 	{
+ 		auto callback = [this] {
++#ifdef ICQRAM_SHELL
++			if (const auto window = resolveActiveWindow(); window && window->widget()->showIcqramAbout()) {
++				return;
++			}
++#endif
+ 			withActiveWindow([](not_null<Window::Controller*> window) {
+ 				window->show(Box(AboutBox));
+ 			});
+@@ -434,6 +442,9 @@ void ForceDisabled(QAction *action, bool disabled) {
+ 	main->addSeparator();
+ 	{
+ 		auto callback = [this] {
++#ifdef ICQRAM_SHELL
++			if (Window::IcqramShell::ShowSettings()) return;
++#endif
+ 			withActiveWindow([](not_null<Window::Controller*> window) {
+ 				window->showSettings();
+ 			});
+diff --git a/Telegram/SourceFiles/platform/mac/notifications_manager_mac_un.h b/Telegram/SourceFiles/platform/mac/notifications_manager_mac_un.h
+index ae9243cc8e..48f8079327 100644
+--- a/Telegram/SourceFiles/platform/mac/notifications_manager_mac_un.h
++++ b/Telegram/SourceFiles/platform/mac/notifications_manager_mac_un.h
+@@ -9,11 +9,17 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
+ 
+ #include "platform/platform_notifications_manager.h"
+ #include "base/weak_ptr.h"
++#include <QtCore/QJsonObject>
+ 
+ namespace Platform {
+ namespace Notifications {
+ 
+ [[nodiscard]] bool UseUNManager();
++#ifdef ICQRAM_SHELL
++void IcqramAuthorization(bool request, Fn<void(QJsonObject)> done);
++void IcqramTestNotification(Fn<void(QString)> done);
++void IcqramOpenNotificationSettings();
++#endif
+ 
+ class UNManager final
+ 	: public Window::Notifications::NativeManager
+diff --git a/Telegram/SourceFiles/platform/mac/notifications_manager_mac_un.mm b/Telegram/SourceFiles/platform/mac/notifications_manager_mac_un.mm
+index 14f4c57060..88305f5634 100644
+--- a/Telegram/SourceFiles/platform/mac/notifications_manager_mac_un.mm
++++ b/Telegram/SourceFiles/platform/mac/notifications_manager_mac_un.mm
+@@ -19,6 +19,11 @@
+ #include "main/main_session.h"
+ #include "platform/mac/notifications_manager_mac_tokens.h"
+ #include "settings.h"
++#ifdef ICQRAM_SHELL
++#include "core/application.h"
++#include "core/core_settings.h"
++#include "window/window_icqram_shell.h"
++#endif
+ #include "window/notifications_utilities.h"
+ 
+ #include <xxhash.h> // XXH64.
+@@ -97,6 +102,15 @@ - (void) userNotificationCenter:(UNUserNotificationCenter *)center
+ - (void) userNotificationCenter:(UNUserNotificationCenter *)center
+ 		didReceiveNotificationResponse:(UNNotificationResponse *)response
+ 		withCompletionHandler:(void (^)(void))completionHandler {
++#ifdef ICQRAM_SHELL
++	if ([response.notification.request.identifier isEqualToString:@"icqram.notification-test"]) {
++		if ([response.actionIdentifier isEqualToString:UNNotificationDefaultActionIdentifier]) {
++			crl::on_main([] { Window::IcqramShell::ShowSettings(); });
++		}
++		completionHandler();
++		return;
++	}
++#endif
+ 	NSDictionary *userInfo = response.notification.request.content.userInfo;
+ 	const auto notificationManagerId
+ 		= Platform::Notifications::NotificationManagerId(userInfo);
+@@ -161,7 +175,12 @@ - (void) userNotificationCenter:(UNUserNotificationCenter *)center
+ } // namespace
+ 
+ bool UseUNManager() {
+-	if (!UNManagerOption().value()
++	if (
++#ifndef ICQRAM_SHELL
++		!UNManagerOption().value()
++#else
++		false
++#endif
+ 		&& ![[NSUserDefaults standardUserDefaults]
+ 			boolForKey:kTelegramUserNotificationsUsed]) {
+ 		return false;
+@@ -172,6 +191,68 @@ bool UseUNManager() {
+ 	return false;
+ }
+ 
++#ifdef ICQRAM_SHELL
++void IcqramAuthorization(bool request, Fn<void(QJsonObject)> done) {
++	if (@available(macOS 10.14, *)) {
++		auto center = [UNUserNotificationCenter currentNotificationCenter];
++		const auto inspect = [center, done] {
++			[center getNotificationSettingsWithCompletionHandler:^(UNNotificationSettings *settings) {
++				const auto status = settings.authorizationStatus == UNAuthorizationStatusNotDetermined ? u"notDetermined"_q
++					: settings.authorizationStatus == UNAuthorizationStatusDenied ? u"denied"_q
++					: u"authorized"_q;
++				const auto result = QJsonObject{
++					{ u"authorization"_q, status },
++					{ u"alerts"_q, settings.alertSetting == UNNotificationSettingEnabled },
++					{ u"sound"_q, settings.soundSetting == UNNotificationSettingEnabled },
++					{ u"banner"_q, settings.alertStyle != UNAlertStyleNone },
++				};
++				crl::on_main([done, result] { done(result); });
++			}];
++		};
++		if (request) {
++			[center requestAuthorizationWithOptions:(UNAuthorizationOptionAlert | UNAuthorizationOptionSound)
++				completionHandler:^(BOOL granted, NSError *error) {
++					if (error) {
++						crl::on_main([done] { done({{u"authorization"_q, u"error"_q}}); });
++					} else {
++						inspect();
++					}
++				}];
++		} else {
++			inspect();
++		}
++	} else {
++		done({{u"authorization"_q, u"unsupported"_q}});
++	}
++}
++
++void IcqramTestNotification(Fn<void(QString)> done) {
++	IcqramAuthorization(false, [done](QJsonObject state) {
++		if (state.value(u"authorization"_q).toString() != u"authorized"_q) {
++			done(u"NOTIFICATIONS_DENIED"_q);
++			return;
++		}
++		if (@available(macOS 10.14, *)) {
++			UNMutableNotificationContent *content = [[[UNMutableNotificationContent alloc] init] autorelease];
++			content.title = @"IBQgram";
++			content.body = @"Your message notifications will appear here.";
++			if (Core::App().settings().soundNotify()) content.sound = [UNNotificationSound defaultSound];
++			UNNotificationRequest *request = [UNNotificationRequest
++				requestWithIdentifier:@"icqram.notification-test" content:content trigger:nil];
++			[[UNUserNotificationCenter currentNotificationCenter] addNotificationRequest:request
++				withCompletionHandler:^(NSError *error) {
++					const auto failed = error != nil;
++					crl::on_main([done, failed] { done(failed ? u"NOTIFICATION_FAILED"_q : QString()); });
++				}];
++		}
++	});
++}
++
++void IcqramOpenNotificationSettings() {
++	[[NSWorkspace sharedWorkspace] openURL:[NSURL URLWithString:@"x-apple.systempreferences:com.apple.Notifications-Settings.extension"]];
++}
++#endif
++
+ class UNManager::Private final {
+ public:
+ 	Private(UNManager *manager);
+diff --git a/Telegram/SourceFiles/platform/mac/specific_mac_p.mm b/Telegram/SourceFiles/platform/mac/specific_mac_p.mm
+index 7125ab3917..eb8073622b 100644
+--- a/Telegram/SourceFiles/platform/mac/specific_mac_p.mm
++++ b/Telegram/SourceFiles/platform/mac/specific_mac_p.mm
+@@ -240,6 +240,10 @@ - (void) receiveUnhideNote:(NSNotification*)aNotification {
+ namespace Platform {
+ 
+ void SetApplicationIcon(const QIcon &icon) {
++#ifdef ICQRAM_SHELL
++	// Keep the bundle's launch icon; session icon overrides create a second Dock appearance.
++	return;
++#else
+ 	NSImage *image = nil;
+ 	if (!icon.isNull()) {
+ 		auto pixmap = icon.pixmap(1024, 1024);
+@@ -247,6 +251,7 @@ void SetApplicationIcon(const QIcon &icon) {
+ 		image = Q2NSImage(pixmap.toImage());
+ 	}
+ 	[[NSApplication sharedApplication] setApplicationIconImage:image];
++#endif
+ }
+ 
+ rpl::producer<bool> ApplicationHiddenValue() {
+diff --git a/Telegram/SourceFiles/platform/mac/tray_mac.h b/Telegram/SourceFiles/platform/mac/tray_mac.h
+index 7e03bddf0b..5cd6d00e25 100644
+--- a/Telegram/SourceFiles/platform/mac/tray_mac.h
++++ b/Telegram/SourceFiles/platform/mac/tray_mac.h
+@@ -20,6 +20,13 @@ class DynamicImage;
+ 
+ namespace Platform {
+ 
++#ifdef ICQRAM_SHELL
++void SetIcqramDockVisible(bool visible);
++bool ShowIcqramStartup(const QString &uiDirectory);
++void HideIcqramStartup();
++void MoveIcqramToCurrentSpace(not_null<QWidget*> widget);
++#endif
++
+ class NativeIcon;
+ 
+ class Tray final {
+@@ -53,6 +60,9 @@ public:
+ 		std::shared_ptr<Ui::DynamicImage> icon,
+ 		int size);
+ 	void addSeparator();
++#ifdef ICQRAM_SHELL
++	void addIcqramPresenceMenu(Fn<QString()> current, Fn<void(QString)> select);
++#endif
+ 
+ 	void showTrayMessage() const;
+ 	[[nodiscard]] bool hasTrayMessageSupport() const;
+diff --git a/Telegram/SourceFiles/platform/mac/tray_mac.mm b/Telegram/SourceFiles/platform/mac/tray_mac.mm
+index d81ca0ae56..a88078ba32 100644
+--- a/Telegram/SourceFiles/platform/mac/tray_mac.mm
++++ b/Telegram/SourceFiles/platform/mac/tray_mac.mm
+@@ -19,8 +19,19 @@
+ 
+ #include <QtWidgets/QMenu>
+ #include <QtGui/QIcon>
++#include <QtGui/QActionGroup>
++#ifdef ICQRAM_SHELL
++#include <QtSvg/QSvgRenderer>
++#include <QtCore/QFile>
++#include "window/window_icqram_shell.h"
++#endif
+ 
+ #import <AppKit/NSMenu.h>
++#ifdef ICQRAM_SHELL
++#import <AppKit/NSPanel.h>
++#import <AppKit/NSVisualEffectView.h>
++#import <WebKit/WebKit.h>
++#endif
+ #import <AppKit/NSStatusItem.h>
+ 
+ @interface CommonDelegate : NSObject<NSMenuDelegate> {
+@@ -82,6 +93,69 @@ - (void) observeValueForKeyPath:(NSString *)keyPath
+ @end // @implementation MenuDelegate
+ 
+ namespace Platform {
++#ifdef ICQRAM_SHELL
++namespace {
++NSPanel *StartupPanel = nil;
++bool StartupShown = false;
++}
++bool ShowIcqramStartup(const QString &uiDirectory) {
++	if (StartupShown) return false;
++	StartupShown = true;
++	auto screen = NSScreen.mainScreen;
++	for (NSScreen *candidate in NSScreen.screens) {
++		if (NSPointInRect(NSEvent.mouseLocation, candidate.frame)) screen = candidate;
++	}
++	if (!screen) return false;
++	StartupPanel = [[NSPanel alloc] initWithContentRect:screen.frame
++		styleMask:NSWindowStyleMaskBorderless | NSWindowStyleMaskNonactivatingPanel
++		backing:NSBackingStoreBuffered defer:NO];
++	StartupPanel.title = @"IBQgram — Starting";
++	StartupPanel.opaque = NO;
++	StartupPanel.backgroundColor = NSColor.clearColor;
++	StartupPanel.hasShadow = NO;
++	StartupPanel.level = NSStatusWindowLevel + 1;
++	StartupPanel.collectionBehavior = NSWindowCollectionBehaviorCanJoinAllSpaces | NSWindowCollectionBehaviorFullScreenAuxiliary;
++	StartupPanel.ignoresMouseEvents = YES;
++	const auto bounds = NSMakeRect(0, 0, screen.frame.size.width, screen.frame.size.height);
++	auto blur = [[NSVisualEffectView alloc] initWithFrame:bounds];
++	blur.material = NSVisualEffectMaterialHUDWindow;
++	blur.blendingMode = NSVisualEffectBlendingModeBehindWindow;
++	blur.state = NSVisualEffectStateActive;
++	blur.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
++	StartupPanel.contentView = blur;
++	auto configuration = [[WKWebViewConfiguration alloc] init];
++	configuration.websiteDataStore = WKWebsiteDataStore.nonPersistentDataStore;
++	configuration.preferences.javaScriptEnabled = NO;
++	configuration.allowsAirPlayForMediaPlayback = NO;
++	auto web = [[WKWebView alloc] initWithFrame:bounds configuration:configuration];
++	[web setValue:@NO forKey:@"drawsBackground"];
++	web.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
++	[blur addSubview:web];
++	const auto directory = [NSURL fileURLWithPath:uiDirectory.toNSString() isDirectory:YES];
++	[web loadFileURL:[directory URLByAppendingPathComponent:@"startup.html"] allowingReadAccessToURL:directory];
++	[StartupPanel orderFrontRegardless];
++	[web release];
++	[configuration release];
++	[blur release];
++	return true;
++}
++void HideIcqramStartup() {
++	if (!StartupPanel) return;
++	[StartupPanel orderOut:nil];
++	[StartupPanel release];
++	StartupPanel = nil;
++}
++
++void MoveIcqramToCurrentSpace(not_null<QWidget*> widget) {
++	const auto window = [reinterpret_cast<NSView*>(widget->winId()) window];
++	window.collectionBehavior = (window.collectionBehavior & ~NSWindowCollectionBehaviorCanJoinAllSpaces) | NSWindowCollectionBehaviorMoveToActiveSpace;
++}
++
++void SetIcqramDockVisible(bool visible) {
++	const auto policy = visible ? NSApplicationActivationPolicyRegular : NSApplicationActivationPolicyAccessory;
++	if (NSApp.activationPolicy != policy) [NSApp setActivationPolicy:policy];
++}
++#endif
+ 
+ namespace {
+ 
+@@ -95,6 +169,19 @@ - (void) observeValueForKeyPath:(NSString *)keyPath
+ }
+ 
+ [[nodiscard]] QImage TrayIconBack(bool darkMode) {
++#ifdef ICQRAM_SHELL
++	auto file = QFile(u":/icqram/assets/brand/static/ibqgram-tray.png"_q);
++	if (file.open(QIODevice::ReadOnly)) {
++		const auto ratio = style::DevicePixelRatio();
++		auto result = QImage::fromData(file.readAll()).scaled(
++			22 * ratio,
++			22 * ratio,
++			Qt::IgnoreAspectRatio,
++			Qt::SmoothTransformation);
++		result.setDevicePixelRatio(ratio);
++		return result;
++	}
++#endif
+ 	static const auto WithColor = [](QColor color) {
+ 		return st::macTrayIcon.instance(color, 100);
+ 	};
+@@ -205,8 +292,10 @@ void UpdateIcon(const NSStatusItem *status) {
+ 	const auto &bgInvert = st::trayCounterBgMacInvert;
+ 
+ 	const auto &resultFg = !darkMode ? fg : muted ? fgInvert : fg;
++#ifndef ICQRAM_SHELL
+ 	PlaceCounter(result, side, counter, bg, resultFg);
+ 	PlaceCounter(resultActive, side, counter, bgInvert, fgInvert);
++#endif
+ 
+ 	// Scale large pixmaps to fit the available menu bar area.
+ 	if (result.height() > maxImageHeight) {
+@@ -223,6 +312,13 @@ void UpdateIcon(const NSStatusItem *status) {
+ 	status.button.image = Q2NSImage(result);
+ 	status.button.alternateImage = Q2NSImage(resultActive);
+ 	status.button.imageScaling = NSImageScaleProportionallyDown;
++#ifdef ICQRAM_SHELL
++	[status.button.image setTemplate:YES];
++	[status.button.alternateImage setTemplate:YES];
++	status.button.title = @"";
++	status.button.imagePosition = NSImageOnly;
++	status.button.bordered = NO;
++#endif
+ }
+ 
+ } // namespace
+@@ -309,7 +405,11 @@ void UpdateIcon(const NSStatusItem *status) {
+ 
+ 	_status.button.target = buttonCallback;
+ 	_status.button.action = @selector(invoke);
++#ifdef ICQRAM_SHELL
++	_status.button.toolTip = @"IBQgram";
++#else
+ 	_status.button.toolTip = Q2NSString(AppName.utf16());
++#endif
+ }
+ 
+ NativeIcon::~NativeIcon() {
+@@ -338,7 +438,9 @@ void UpdateIcon(const NSStatusItem *status) {
+ 			: nullptr;
+ 		if (menu) {
+ 			_status.menu = menu->toNSMenu();
++#ifndef ICQRAM_SHELL
+ 			_status.menu.delegate = _delegate;
++#endif
+ 		} else {
+ 			_status.menu = nil;
+ 		}
+@@ -366,14 +468,22 @@ void UpdateIcon(const NSStatusItem *status) {
+ 		// On macOS we are activating the window on click
+ 		// instead of showing the menu, when the window is not activated.
+ 		_nativeIcon->setMenuProvider([=](bool rightButton) -> QMenu* {
++#ifdef ICQRAM_SHELL
++			return rightButton ? _menu.get() : nullptr;
++#else
+ 			return (_menu && (rightButton || IsAnyActiveForTrayMenu()))
+ 				? _menu.get()
+ 				: nullptr;
++#endif
+ 		});
+ 		_nativeIcon->activateRequests(
+ 		) | rpl::on_next([=] {
+ 			_nativeIcon->deactivateButton();
++#ifdef ICQRAM_SHELL
++			if (!Window::IcqramShell::ShowMain(true)) _showFromTrayRequests.fire({});
++#else
+ 			_showFromTrayRequests.fire({});
++#endif
+ 		}, _lifetime);
+ 		_nativeIcon->aboutToShowRequests(
+ 		) | rpl::start_to_stream(_aboutToShowRequests, _lifetime);
+@@ -394,6 +504,9 @@ void UpdateIcon(const NSStatusItem *status) {
+ void Tray::createMenu() {
+ 	if (!_menu) {
+ 		_menu = base::make_unique_q<QMenu>(nullptr);
++#ifdef ICQRAM_SHELL
++		QObject::connect(_menu.get(), &QMenu::aboutToShow, _menu.get(), [=] { _aboutToShowRequests.fire({}); });
++#endif
+ 	}
+ }
+ 
+@@ -456,6 +569,32 @@ void UpdateIcon(const NSStatusItem *status) {
+ 	}, _actionsLifetime);
+ }
+ 
++#ifdef ICQRAM_SHELL
++void Tray::addIcqramPresenceMenu(Fn<QString()> current, Fn<void(QString)> select) {
++	if (!_menu) return;
++	const auto menu = _menu->addMenu(u"Durum değiştir"_q);
++	const auto group = new QActionGroup(menu);
++	group->setExclusive(true);
++	const auto states = std::vector<std::pair<QString, QString>>{
++		{u"AV"_q, u"Available / Connect"_q}, {u"FC"_q, u"Free for Chat"_q},
++		{u"AW"_q, u"Away"_q}, {u"NA"_q, u"N/A (Extended Away)"_q},
++		{u"OC"_q, u"Occupied (Urgent Msgs)"_q}, {u"DND"_q, u"DND (Do Not Disturb)"_q},
++		{u"IV"_q, u"Privacy (Invisible)"_q}, {u"OF"_q, u"Offline / Disconnect"_q},
++		{u"PH"_q, u"On the Phone"_q}, {u"LC"_q, u"Out to Lunch"_q},
++	};
++	for (const auto &[code, label] : states) {
++		const auto action = menu->addAction(label, [=] { select(code); });
++		action->setData(code);
++		action->setCheckable(true);
++		group->addAction(action);
++	}
++	QObject::connect(menu, &QMenu::aboutToShow, menu, [=] {
++		const auto code = current();
++		for (const auto action : menu->actions()) action->setChecked(action->data().toString() == code);
++	});
++}
++#endif
++
+ void Tray::addSeparator() {
+ 	if (_menu) {
+ 		_menu->addSeparator();
+diff --git a/Telegram/SourceFiles/tray.cpp b/Telegram/SourceFiles/tray.cpp
+index 6abba928c8..c807b3803a 100644
+--- a/Telegram/SourceFiles/tray.cpp
++++ b/Telegram/SourceFiles/tray.cpp
+@@ -6,6 +6,9 @@ For license and copyright information please follow this link:
+ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
+ */
+ #include "tray.h"
++#ifdef ICQRAM_SHELL
++#include "window/window_icqram_shell.h"
++#endif
+ #include "tray_accounts_menu.h"
+ 
+ #include "core/application.h"
+@@ -31,6 +34,9 @@ Tray::Tray() {
+ 
+ void Tray::create() {
+ 	rebuildMenu();
++#ifdef ICQRAM_SHELL
++	Core::App().settings().setWorkMode(Settings::WorkMode::WindowAndTray);
++#endif
+ 	using WorkMode = Settings::WorkMode;
+ 	if (Core::App().settings().workMode() != WorkMode::WindowOnly) {
+ 		_tray.createIcon();
+@@ -80,6 +86,19 @@ void Tray::create() {
+ void Tray::rebuildMenu() {
+ 	_tray.destroyMenu();
+ 	_tray.createMenu();
++#ifdef ICQRAM_SHELL
++	_tray.addAction(rpl::single(u"Pencereyi aç"_q), [=] {
++		if (!Window::IcqramShell::ShowMain(true)) Core::App().activate();
++	});
++#ifdef Q_OS_MAC
++	if (!Core::App().passcodeLocked()) _tray.addIcqramPresenceMenu(
++		[] { return Window::IcqramShell::LocalPresence(); },
++		[](QString code) { Window::IcqramShell::SetLocalPresence(code); });
++#endif
++	_tray.addSeparator();
++	_tray.addAction(rpl::single(u"Çıkış yap"_q), [] { Core::Quit(); });
++	return;
++#endif
+ 
+ 	{
+ 		auto minimizeText = _textUpdates.events(
+diff --git a/Telegram/SourceFiles/window/main_window.cpp b/Telegram/SourceFiles/window/main_window.cpp
+index 62f8c797ca..4cff7d6ddb 100644
+--- a/Telegram/SourceFiles/window/main_window.cpp
++++ b/Telegram/SourceFiles/window/main_window.cpp
+@@ -935,7 +935,7 @@ void MainWindow::updateTitle() {
+ 		: Dialogs::Key();
+ 	const auto thread = key ? key.thread() : nullptr;
+ 	if (!thread) {
+-		setTitle((user.isEmpty() ? u"Telegram"_q : user) + added + suffix);
++		setTitle((user.isEmpty() ? u"icqram"_q : user) + added + suffix);
+ 		return;
+ 	}
+ 	const auto history = thread->owningHistory();
+diff --git a/Telegram/SourceFiles/window/notifications_manager.cpp b/Telegram/SourceFiles/window/notifications_manager.cpp
+index 9aac369dc2..6874048c73 100644
+--- a/Telegram/SourceFiles/window/notifications_manager.cpp
++++ b/Telegram/SourceFiles/window/notifications_manager.cpp
+@@ -6,6 +6,10 @@ For license and copyright information please follow this link:
+ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
+ */
+ #include "window/notifications_manager.h"
++#ifdef ICQRAM_SHELL
++#include "window/notifications_icqram.h"
++#include "window/window_icqram_shell.h"
++#endif
+ 
+ #include "base/options.h"
+ #include "base/platform/base_platform_info.h"
+@@ -338,6 +342,9 @@ System::SkipState System::computeSkipState(
+ 		Data::ItemNotification notification) const {
+ 	const auto type = notification.type;
+ 	const auto item = notification.item;
++#ifdef ICQRAM_SHELL
++	if (!IcqramAllowsNotification(item)) return { SkipState::Skip };
++#endif
+ 	const auto thread = item->notificationThread();
+ 	const auto notifySettings = &thread->owner().notifySettings();
+ 	const auto messageType = (type == Data::ItemNotificationType::Message);
+@@ -1103,6 +1110,10 @@ QByteArray System::lookupSoundBytes(
+ 		const auto custom = notifySettings.lookupRingtone(id);
+ 		return custom ? ReadRingtoneBytes(custom) : QByteArray();
+ 	}
++#ifdef ICQRAM_SHELL
++	auto classic = QFile(IcqramSoundPath());
++	if (classic.open(QIODevice::ReadOnly)) return classic.readAll();
++#endif
+ 	auto f = QFile(Core::App().settings().getSoundPath(u"msg_incoming"_q));
+ 	if (f.open(QIODevice::ReadOnly)) {
+ 		return f.readAll();
+@@ -1144,6 +1155,13 @@ void System::ensureSoundCreated() {
+ 	}
+ 
+ 	_soundTrack = Media::Audio::Current().createTrack();
++#ifdef ICQRAM_SHELL
++	const auto classic = IcqramSoundPath();
++	if (!classic.isEmpty()) {
++		_soundTrack->fillFromFile(classic);
++		return;
++	}
++#endif
+ 	_soundTrack->fillFromFile(
+ 		Core::App().settings().getSoundPath(u"msg_incoming"_q));
+ }
+@@ -1450,7 +1468,7 @@ void Manager::notificationActivated(
+ 			history,
+ 			id.msgId,
+ 			openSeparated);
+-		onAfterNotificationActivated(id, window);
++		if (window) onAfterNotificationActivated(id, window);
+ 	}
+ }
+ 
+@@ -1467,6 +1485,15 @@ Window::SessionController *Manager::openNotificationMessage(
+ 		}
+ 		return window;
+ 	}
++#ifdef ICQRAM_SHELL
++	const auto target = history->owner().message(history->peer, messageId);
++	if (IcqramShell::OpenNotificationChat(&history->session().account(), history->peer->id,
++			target ? target->topicRootId() : MsgId())) {
++		if (target && target->topic()) system()->clearFromTopic(target->topic());
++		else system()->clearFromHistory(history);
++		return nullptr;
++	}
++#endif
+ 	const auto item = history->owner().message(history->peer, messageId);
+ 	const auto openExactlyMessage = !history->peer->isBroadcast()
+ 		&& item
+diff --git a/Telegram/SourceFiles/window/window_icqram_shell.cpp b/Telegram/SourceFiles/window/window_icqram_shell.cpp
+new file mode 100644
+index 0000000000..5954170404
+--- /dev/null
++++ b/Telegram/SourceFiles/window/window_icqram_shell.cpp
+@@ -0,0 +1,687 @@
++#include "window/window_icqram_shell.h"
++
++#include "core/application.h"
++#include "core/core_settings.h"
++#include "window/notifications_icqram.h"
++#include "window/notifications_manager.h"
++#include "base/invoke_queued.h"
++#include "webview/webview_embed.h"
++#include "webview/webview_data_stream_memory.h"
++#include "intro/intro_icqram_auth.h"
++#include "intro/intro_widget.h"
++#include "main/main_account.h"
++#include "api/api_icqram_account.h"
++#include "api/api_icqram_chat.h"
++#include "main/main_session.h"
++#include "data/data_session.h"
++#include "data/data_user.h"
++#include "data/data_chat.h"
++#include "data/data_channel.h"
++#include <QtCore/QRegularExpression>
++
++#include <QtCore/QFile>
++#include <QtCore/QSettings>
++#include <QtCore/QJsonDocument>
++#include <QtCore/QJsonObject>
++#include <QtCore/QJsonArray>
++#include <QtCore/QDateTime>
++#include <QtCore/QMimeDatabase>
++#include <QtCore/QCoreApplication>
++#include <QtCore/QDir>
++#include <QtCore/QUrl>
++#include <QtGui/QScreen>
++#include <QtGui/QGuiApplication>
++#include <QtGui/QWindow>
++#include <QtGui/QCursor>
++#include <QtWidgets/QLabel>
++#include <QtWidgets/QApplication>
++#ifdef Q_OS_MAC
++#include "platform/mac/tray_mac.h"
++#include "platform/mac/notifications_manager_mac_un.h"
++#endif
++
++namespace Window {
++namespace {
++bool IsAuxiliary(const QString &kind) {
++	return kind == u"profile"_q || kind == u"settings"_q || kind == u"about"_q
++		|| kind == u"commands"_q || kind == u"presence"_q || kind == u"info"_q || kind == u"now"_q;
++}
++}
++
++IcqramShell::IcqramShell(QWidget *parent, not_null<Main::Account*> account, not_null<Controller*> controller, QString peerId, int mediaId, Api::IcqramChat *mediaApi, QJsonObject panelData)
++: RpWidget(parent)
++, _account(account)
++, _controller(controller)
++, _peerId(std::move(peerId))
++, _mediaId(mediaId)
++, _mediaApi(mediaApi) {
++	if (!account->sessionExists()) {
++		_authData.reset(new Intro::details::Data{ .controller = controller });
++		_auth = std::make_unique<Intro::IcqramAuth>(this, account, _authData.get());
++	}
++	_accountApi = std::make_unique<Api::IcqramAccount>(account, [=] {
++		return !_locked && !Core::App().passcodeLocked() && _account->sessionExists();
++	});
++#ifdef Q_OS_MAC
++	const auto origin = QUrl::fromLocalFile(
++		QDir::cleanPath(QCoreApplication::applicationDirPath()
++			+ u"/../Resources/ui"_q) + '/').toString();
++#else
++	const auto origin = u"icqram-ui://domain/"_q;
++#endif
++	setWindowFlags(Qt::Window | Qt::FramelessWindowHint);
++	setAttribute(Qt::WA_TranslucentBackground);
++	setWindowTitle(_peerId == u"profile"_q ? u"IBQgram — Account details"_q : _mediaId ? u"IBQgram — Medya görüntüleyici"_q : _peerId.isEmpty() ? u"IBQgram"_q : _peerId == u"directory"_q ? u"IBQgram — User Directory"_q : u"IBQgram — Sohbet"_q);
++	if (IsAuxiliary(_peerId)) setWindowTitle(u"IBQgram — "_q + (_peerId == u"now"_q ? u"ICQ Now!"_q : _peerId));
++	QApplication::setQuitOnLastWindowClosed(false);
++	if (_mediaId) setFixedSize(640, 520);
++	else if (_peerId.isEmpty()) { setMinimumSize(236, 300); setMaximumSize(900, 1000); const auto saved = QSettings(u"icqram"_q, u"icqram"_q).value(u"windows/contactsSize"_q).toSize();
++		resize(account->sessionExists() && saved.isValid() ? saved.boundedTo(QSize(900, 1000)).expandedTo(QSize(236, 300)) : QSize(320, 370)); }
++	else if (_peerId == u"now"_q) { setMinimumSize(500, 400); setMaximumSize(1400, 1100); resize(820, 740); }
++	else if (_peerId == u"profile"_q) { setFixedSize(320, 340); }
++	else if (_peerId == u"commands"_q) { setFixedSize(400, 350); }
++	else if (_peerId == u"settings"_q) { setFixedSize(400, 560); }
++	else if (_peerId == u"about"_q) { setFixedSize(350, 280); }
++	else if (_peerId == u"presence"_q) { setFixedSize(350, 400); }
++	else if (_peerId == u"info"_q) { setMinimumSize(320, 200); resize(360, 280); }
++	else if (_peerId == u"directory"_q) { setMinimumSize(456, 437); setMaximumSize(1000, 900); resize(456, 437); }
++	else { setMinimumSize(476, 267); setMaximumSize(1200, 900); resize(600, 440); }
++	if (const auto screen = QGuiApplication::primaryScreen()) {
++		move(screen->availableGeometry().center() - rect().center());
++	}
++	_webview = std::make_unique<Webview::Window>(this, Webview::WindowConfig{
++		.opaqueBg = QColor(0, 0, 0, 0),
++		.storageId = {
++			.token = QByteArray::fromHex("7b06519d4a8d44d9bca6923931175aa2"),
++		},
++		.dataProtocolOverride = u"icqram-ui"_q,
++#ifdef Q_OS_MAC
++		.localContentDirectory = QUrl(origin).toLocalFile(),
++#endif
++	});
++	if (!_webview->valid()) {
++		const auto error = new QLabel(
++			u"IBQgram başlatılamadı. Uygulamayı yeniden açmayı dene."_q,
++			this);
++		error->setAlignment(Qt::AlignCenter);
++		sizeValue() | rpl::on_next([=](QSize size) {
++			error->setGeometry(QRect(QPoint(), size));
++		}, lifetime());
++		return;
++	}
++	_webview->setPermissionHandler([](
++			Webview::PermissionType,
++			std::function<void(bool)> done) {
++		done(false);
++	});
++	_webview->setNavigationPolicyHandler([=](QString url, bool newWindow) {
++		const auto allowed = !newWindow
++			&& (url == origin + u"index.html"_q
++				|| url == origin + u"brand.html"_q
++				|| (_peerId == u"now"_q && (url == origin + u"now.html"_q || url == u"about:blank"_q)));
++		LOG(("icqram local navigation: allowed=%1, local=%2").arg(allowed).arg(url.startsWith(u"file:"_q)));
++		return allowed;
++	});
++	_webview->setNavigationDoneHandler([](bool success) {
++		LOG(("icqram local document loaded: %1").arg(success));
++	});
++	_webview->setDataRequestHandler([=](Webview::DataRequest request) {
++		if (request.id == "media/playback") {
++			if (!_mediaId || !_mediaApi || _locked || Core::App().passcodeLocked()
++				|| !_account->sessionExists() || !isVisible()) return Webview::DataResult::Failed;
++			auto chunk = _mediaApi->mediaChunk(_mediaId, request.offset, request.limit);
++			if (chunk.bytes.isEmpty()) return Webview::DataResult::Failed;
++			request.done({
++				.stream = std::make_unique<Webview::DataStreamFromMemory>(std::move(chunk.bytes), chunk.mime.toStdString()),
++				.streamOffset = request.offset,
++				.totalSize = chunk.total,
++			});
++			return Webview::DataResult::Done;
++		}
++		const auto id = QString::fromStdString(request.id).section('?', 0, 0);
++		if (id.isEmpty()
++			|| id.contains(u".."_q)
++			|| id.contains('%')
++			|| id.contains('\\')
++			|| id.startsWith('/')) {
++			return Webview::DataResult::Failed;
++		}
++		auto file = QFile(u":/icqram/"_q + id);
++		if (!file.open(QIODevice::ReadOnly)) {
++			return Webview::DataResult::Failed;
++		}
++		auto data = file.readAll();
++		const auto size = data.size();
++		if (size <= 0 || request.offset < 0 || request.offset >= size) {
++			return Webview::DataResult::Failed;
++		}
++		const auto mime = QMimeDatabase().mimeTypeForFile(id).name();
++		request.done({
++			.stream = std::make_unique<Webview::DataStreamFromMemory>(
++				std::move(data),
++				mime.toStdString()),
++			.totalSize = size,
++		});
++		return Webview::DataResult::Done;
++	});
++	#ifdef Q_OS_MAC
++	if (_peerId.isEmpty() && !_mediaId) {
++		_startupActive = Platform::ShowIcqramStartup(QUrl(origin).toLocalFile());
++		_startupDeadline.setCallback([=] { finishStartup(); });
++		if (_startupActive) _startupDeadline.callOnce(6500);
++	}
++#endif
++	const auto context = QJsonDocument(QJsonObject{
++		{u"nativeStartup"_q, _startupActive},
++		{u"notifications"_q, Notifications::IcqramPreferences()},
++		{u"panelData"_q, panelData}, {u"localPresence"_q, LocalPresence()},
++		{u"contactsSize"_q, [&] {
++			const auto size = QSettings(u"icqram"_q, u"icqram"_q).value(u"windows/contactsSize"_q).toSize();
++			return size.isValid() ? QJsonObject{{u"width"_q, size.width()}, {u"height"_q, size.height()}} : QJsonObject();
++		}()},
++		{u"kind"_q, _mediaId ? u"viewer"_q : IsAuxiliary(_peerId) ? _peerId : _peerId == u"directory"_q ? u"directory"_q : !_peerId.isEmpty() ? u"chat"_q : account->sessionExists() ? u"contacts"_q : u"login"_q},
++		{u"fixtures"_q, false}, {u"contactId"_q, _peerId}, {u"messageId"_q, _mediaId},
++		{u"ownUin"_q, account->sessionExists() ? QString::number(account->session().userId().bare) : QString()}
++	}).toJson(QJsonDocument::Compact);
++	_webview->init("Object.defineProperty(window,'icqramView',{value:Object.freeze(" + context + ")});" + QByteArray(R"JS(
++Object.defineProperty(window, 'icqramHost', { value: Object.freeze({
++ postMessage: value => window.external.invoke(value)
++}) });
++)JS"));
++	if (!_mediaId && !_peerId.isEmpty() && _peerId != u"directory"_q && !IsAuxiliary(_peerId)) {
++		_chatApi = std::make_unique<Api::IcqramChat>(account, _peerId, [=] {
++			return !_locked && !Core::App().passcodeLocked() && _account->sessionExists();
++		}, [=] {
++			if (isVisible()) _webview->eval("window.dispatchEvent(new Event('icqram-chat-changed'));");
++		});
++	}
++	_webview->setMessageHandler([=](Webview::Message message) {
++		if (QString::fromStdString(message.sourceUrl) != origin + (_peerId == u"now"_q ? u"now.html"_q : u"index.html"_q)
++			|| message.text.size() > 65536) {
++			return;
++		}
++		const auto body = QJsonDocument::fromJson(
++			QByteArray::fromStdString(message.text)).object();
++		const auto id = body.value(u"id"_q).toInteger();
++		if (body.value(u"version"_q).toInt() != 1 || id <= 0) {
++			return;
++		}
++		auto reply = QJsonObject{
++			{ u"version"_q, 1 },
++			{ u"id"_q, id },
++		};
++		const auto method = body.value(u"method"_q).toString();
++		const auto params = body.value(u"params"_q).toObject();
++		if (_peerId == u"now"_q && method != u"window.close"_q && method != u"window.minimize"_q
++			&& method != u"window.resize"_q && method != u"window.dragStart"_q
++			&& method != u"window.dragMove"_q && method != u"window.dragEnd"_q) {
++			return sendReply(id, {}, u"UNSUPPORTED_METHOD"_q);
++		}
++		if ((_locked || Core::App().passcodeLocked()) && method != u"window.close"_q) {
++			return sendReply(id, {}, u"LOCKED"_q);
++		}
++		if (method == u"window.openCommands"_q && _chatApi && !_mediaId && _account->sessionExists()) {
++			const auto peer = _account->session().data().peerLoaded(Api::IcqramPeerId(_peerId));
++			if (!peer || !peer->isBot()) return sendReply(id, {}, u"INVALID_REQUEST"_q);
++			const auto query = params.value(u"query"_q).toString().left(64);
++			InvokeQueued(this, [=] {
++				if (_locked || Core::App().passcodeLocked() || !_account->sessionExists()) return;
++				auto &commands = _chats[u"commands"_q];
++				const auto data = QJsonObject{{u"query"_q, query}, {u"name"_q, peer->name()}};
++				if (!commands) commands = std::make_unique<IcqramShell>(nullptr, _account, _controller, u"commands"_q, 0, nullptr, data);
++				commands->_commandOwner = this;
++				commands->_commandTopic = _chatApi->currentTopicId();
++				commands->focus();
++				commands->_webview->eval("window.dispatchEvent(new CustomEvent('icqram-commands-open',{detail:"
++					+ QJsonDocument(data).toJson(QJsonDocument::Compact) + "}));");
++			});
++			return sendReply(id, {{u"ok"_q, true}});
++		}
++		if (_peerId == u"commands"_q && method.startsWith(u"commands."_q)) {
++			const auto owner = _commandOwner.data();
++			if (!owner || owner->_locked || !owner->_chatApi || !_account->sessionExists()) return sendReply(id, {}, u"LOCKED"_q);
++			if (method != u"commands.load"_q && method != u"commands.refresh"_q && method != u"commands.select"_q) return sendReply(id, {}, u"INVALID_REQUEST"_q);
++			owner->_chatApi->request(method == u"commands.refresh"_q ? u"chat.commands.refresh"_q : u"chat.state"_q, {},
++				crl::guard(this, [=](QJsonObject state, QString error) {
++					if (!error.isEmpty()) return sendReply(id, {}, error);
++					if (method != u"commands.select"_q) return sendReply(id, state);
++					if (!isVisible() || !state.value(u"canSend"_q).toBool() || state.value(u"blocked"_q).toBool()) return sendReply(id, {}, u"CHAT_READ_ONLY"_q);
++					if (owner->_chatApi->currentTopicId() != _commandTopic) return sendReply(id, {}, u"TOPIC_CHANGED"_q);
++					const auto command = params.value(u"command"_q).toString();
++					auto found = false;
++					for (const auto item : state.value(u"commands"_q).toArray()) {
++						if (item.toObject().value(u"command"_q).toString() == command) found = true;
++					}
++					if (!found) return sendReply(id, {}, u"INVALID_REQUEST"_q);
++					const auto data = QJsonDocument(QJsonObject{{u"command"_q, command}, {u"topicId"_q, _commandTopic}}).toJson(QJsonDocument::Compact);
++					sendReply(id, {{u"ok"_q, true}});
++					hide();
++					owner->focus();
++					owner->_webview->eval("window.dispatchEvent(new CustomEvent('icqram-command-selected',{detail:" + data + "}));");
++				}));
++			return;
++		}
++		if (method.startsWith(u"notifications."_q) && _account->sessionExists()) {
++			if (method == u"notifications.save"_q) {
++				if (!Notifications::SaveIcqramPreferences(params)) return sendReply(id, {}, u"INVALID_REQUEST"_q);
++				const auto state = Notifications::IcqramPreferences();
++				const auto data = QJsonDocument(state).toJson(QJsonDocument::Compact);
++				for (const auto widget : QApplication::topLevelWidgets()) {
++					const auto shell = dynamic_cast<IcqramShell*>(widget);
++					if (shell && shell->_webview && shell->_peerId != u"now"_q) {
++						shell->_webview->eval("window.dispatchEvent(new CustomEvent('icqram-notifications',{detail:" + data + "}));");
++					}
++				}
++				return sendReply(id, state);
++			}
++#ifdef Q_OS_MAC
++			if (method == u"notifications.load"_q || method == u"notifications.authorize"_q) {
++				Platform::Notifications::IcqramAuthorization(method == u"notifications.authorize"_q,
++					crl::guard(this, [=](QJsonObject result) {
++						auto state = Notifications::IcqramPreferences();
++						state.insert(u"system"_q, result);
++						sendReply(id, state);
++					}));
++				return;
++			} else if (method == u"notifications.test"_q && _peerId == u"settings"_q) {
++				Platform::Notifications::IcqramTestNotification(crl::guard(this, [=](QString error) {
++					sendReply(id, {{u"ok"_q, error.isEmpty()}}, error);
++				}));
++				return;
++			} else if (method == u"notifications.systemSettings"_q && _peerId == u"settings"_q) {
++				Platform::Notifications::IcqramOpenNotificationSettings();
++				return sendReply(id, {{u"ok"_q, true}});
++			}
++#endif
++			return sendReply(id, {}, u"UNSUPPORTED_METHOD"_q);
++		}
++		if (method == u"startup.finish"_q && _peerId.isEmpty()) {
++			InvokeQueued(this, [=] { finishStartup(); });
++			return sendReply(id, {{u"ok"_q, true}});
++		} else if (method == u"window.openPanel"_q) {
++			const auto kind = params.value(u"kind"_q).toString();
++			if (!IsAuxiliary(kind) || kind == u"commands"_q) return sendReply(id, {}, u"INVALID_REQUEST"_q);
++			if ((kind == u"presence"_q || kind == u"profile"_q) && !_account->sessionExists()) return sendReply(id, {}, u"LOCKED"_q);
++			auto data = QJsonObject();
++			if (kind == u"info"_q) {
++				const auto title = params.value(u"title"_q).toString();
++				const auto lines = params.value(u"lines"_q).toArray();
++				if (title.size() > 120 || lines.size() > 16) return sendReply(id, {}, u"INVALID_REQUEST"_q);
++				for (const auto line : lines) if (!line.isString() || line.toString().size() > 2000) return sendReply(id, {}, u"INVALID_REQUEST"_q);
++				data = {{u"title"_q, title}, {u"lines"_q, lines}};
++			}
++			InvokeQueued(this, [=] { openAuxiliary(kind, data); });
++			return sendReply(id, {{u"ok"_q, true}});
++		} else if (method == u"window.openProfile"_q && _peerId.isEmpty() && _account->sessionExists()) {
++			InvokeQueued(this, [=] {
++				if (_locked || Core::App().passcodeLocked() || !_account->sessionExists()) return;
++				auto &profile = _chats[u"profile"_q];
++				if (!profile) profile = std::make_unique<IcqramShell>(nullptr, _account, _controller, u"profile"_q);
++				profile->focus();
++			});
++			return sendReply(id, {{u"ok"_q, true}});
++		} else if (method == u"bootstrap"_q) {
++			reply.insert(u"result"_q, _account->sessionExists()
++				? QJsonObject{{u"auth"_q, u"ready"_q}, {u"connected"_q, _account->mtp().dcstate() == MTP::ConnectedState}}
++				: (_auth ? _auth->state() : QJsonObject{{u"auth"_q, u"phone"_q}, {u"connected"_q, false}}));
++		} else if (method == u"window.openMedia"_q && _chatApi && !_mediaId && _account->sessionExists()) {
++            const auto messageId = params.value(u"messageId"_q).toInt();
++            if (!_chatApi->canViewMedia(messageId)) return sendReply(id, {}, u"FILE_UNAVAILABLE"_q);
++            InvokeQueued(this, [=] {
++                if (_locked || Core::App().passcodeLocked() || !_account->sessionExists()) return;
++                if (!_viewer || _viewer->_mediaId != messageId) _viewer = std::make_unique<IcqramShell>(nullptr, _account, _controller, _peerId, messageId, _chatApi.get());
++                _viewer->focus();
++            });
++            return sendReply(id, {{u"ok"_q,true}});
++        } else if (_mediaId && _mediaApi && _account->sessionExists() && (method == u"viewer.load"_q || method == u"viewer.save"_q || method == u"viewer.cancel"_q)) {
++            const auto target = method == u"viewer.load"_q ? u"chat.media.get"_q : method == u"viewer.save"_q ? u"chat.media.save"_q : u"chat.media.cancel"_q;
++            _mediaApi->request(target, {{u"messageId"_q,_mediaId}}, crl::guard(this, [=](QJsonObject result, QString error) {sendReply(id,std::move(result),std::move(error));}));
++            return;
++        } else if (method.startsWith(u"chat."_q) && _chatApi && _account->sessionExists()) {
++            if (method == u"chat.read"_q && (!isVisible() || isMinimized() || !isActiveWindow())) return sendReply(id, {}, u"NOT_VISIBLE"_q);
++			_chatApi->request(method, params, crl::guard(this, [=](QJsonObject result, QString error) {
++				sendReply(id, std::move(result), std::move(error));
++			}));
++			return;
++		} else if (method == u"window.openDirectory"_q && _peerId.isEmpty() && _account->sessionExists()) {
++			InvokeQueued(this, [=] {
++				if (_locked || Core::App().passcodeLocked() || !_account->sessionExists()) return;
++				auto &directory = _chats[u"directory"_q];
++				if (!directory) directory = std::make_unique<IcqramShell>(nullptr, _account, _controller, u"directory"_q);
++				directory->focus();
++			});
++			reply.insert(u"result"_q, QJsonObject{{u"ok"_q, true}});
++		} else if (method == u"window.openChat"_q && (_peerId.isEmpty() || _peerId == u"directory"_q) && _account->sessionExists()) {
++			const auto peerId = params.value(u"contactId"_q).toString();
++			const auto parsedId = Api::IcqramPeerId(peerId);
++			const auto peer = parsedId ? _account->session().data().peerLoaded(parsedId) : nullptr;
++			if (!peer) return sendReply(id, {}, u"PEER_UNAVAILABLE"_q);
++			if (const auto user = peer->asUser()) {
++				if (user->isInaccessible() || (!user->accessHash() && !user->isSelf())) return sendReply(id, {}, u"PEER_UNAVAILABLE"_q);
++			} else if (const auto chat = peer->asChat()) {
++				if (!chat->amIn()) return sendReply(id, {}, u"PEER_UNAVAILABLE"_q);
++			} else if (const auto channel = peer->asChannel()) {
++				if (!channel->amIn()) return sendReply(id, {}, u"PEER_UNAVAILABLE"_q);
++			} else return sendReply(id, {}, u"PEER_UNAVAILABLE"_q);
++			auto owner = this;
++			for (const auto widget : QApplication::topLevelWidgets()) {
++				const auto shell = dynamic_cast<IcqramShell*>(widget);
++				if (shell && shell->_peerId.isEmpty() && shell->_account == _account) { owner = shell; break; }
++			}
++			if (!owner->_chats.contains(peerId) && owner->_chats.size() >= 17) return sendReply(id, {}, u"TOO_MANY_WINDOWS"_q);
++			InvokeQueued(owner, [=] {
++				if (owner->_locked || Core::App().passcodeLocked() || !owner->_account->sessionExists()) return;
++				auto &chat = owner->_chats[peerId];
++				if (!chat) {
++					chat = std::make_unique<IcqramShell>(nullptr, owner->_account, owner->_controller, peerId);
++				}
++				chat->focus();
++			});
++			reply.insert(u"result"_q, QJsonObject{{u"ok"_q, true}});
++		} else if (method == u"preferences.theme"_q) {
++			const auto theme = params.value(u"theme"_q).toString();
++			if (theme != u"system"_q && theme != u"light"_q && theme != u"dark"_q) return sendReply(id, {}, u"INVALID_REQUEST"_q);
++			const auto json = QJsonDocument(QJsonObject{{u"theme"_q, theme}}).toJson(QJsonDocument::Compact);
++			for (const auto widget : QApplication::topLevelWidgets()) {
++				if (const auto shell = dynamic_cast<IcqramShell*>(widget)) shell->_webview->eval("window.dispatchEvent(new CustomEvent('icqram-theme',{detail:" + json + "}));");
++			}
++			reply.insert(u"result"_q, QJsonObject{{u"ok"_q, true}});
++		} else if (method == u"presence.local"_q && (_peerId.isEmpty() || _peerId == u"presence"_q) && _account->sessionExists()) {
++			static const auto validCode = QRegularExpression(u"^(AV|FC|AW|NA|OC|DND|IV|OF|PH|LC)$"_q);
++			const auto code = params.value(u"code"_q).toString();
++			if (!validCode.match(code).hasMatch()) return sendReply(id, {}, u"INVALID_REQUEST"_q);
++            auto settings=QSettings(u"icqram"_q,u"icqram"_q);
++            settings.setValue(u"accounts/"_q + QString::number(_account->session().userId().bare) + u"/presence"_q,code);
++            if (code == u"DND"_q && Notifications::IcqramPreferences().value(u"pauseInDnd"_q).toBool()) Core::App().notifications().clearAll();
++            settings.sync();
++            if(settings.status()!=QSettings::NoError)return sendReply(id,{},u"SAVE_FAILED"_q);
++            const auto data=QJsonDocument(QJsonObject{{u"code"_q,code}}).toJson(QJsonDocument::Compact);
++            for(const auto widget:QApplication::topLevelWidgets()) {
++                const auto shell=dynamic_cast<IcqramShell*>(widget);
++                if(!shell || shell->_account!=_account || shell->_peerId==u"now"_q)continue;
++                shell->_presenceCode=code;
++                shell->_webview->eval("document.dispatchEvent(new CustomEvent('icqram-presence-changed',{detail:"+data+"}));");
++            }
++			reply.insert(u"result"_q, QJsonObject{{u"ok"_q, true}});
++		} else if (method == u"auth.qr"_q) {
++			return sendReply(id, {}, u"QR_UNAVAILABLE"_q);
++		} else if (method.startsWith(u"auth."_q) && _auth) {
++			_auth->request(method, params, crl::guard(this, [=](QJsonObject result, QString error) {
++				sendReply(id, std::move(result), std::move(error));
++			}));
++			return;
++		} else if (method == u"account.logout"_q && _account->sessionExists()) {
++			sendReply(id, {{u"ok"_q, true}});
++			InvokeQueued(this, [=] { _account->logOut(); });
++			return;
++		} else if ((method == u"contacts.load"_q || method == u"dialogs.load"_q || method == u"contacts.snapshot"_q || method == u"profile.load"_q || method == u"presence.set"_q || (method.startsWith(u"directory."_q) && _peerId == u"directory"_q)) && _account->sessionExists()) {
++            auto api=_accountApi.get();
++            if(method==u"presence.set"_q)for(const auto widget:QApplication::topLevelWidgets()) {
++                const auto shell=dynamic_cast<IcqramShell*>(widget);
++                if(shell && shell->_account==_account && shell->_peerId.isEmpty()){api=shell->_accountApi.get();break;}
++            }
++			api->request(method, params, crl::guard(this, [=](QJsonObject result, QString error) {
++				if (method == u"directory.add"_q && result.value(u"added"_q).toBool()) {
++					for (const auto widget : QApplication::topLevelWidgets()) {
++						if (const auto shell = dynamic_cast<IcqramShell*>(widget); shell && shell->_peerId.isEmpty()) shell->_webview->eval("document.dispatchEvent(new Event('icqram-refresh-contacts'));");
++					}
++				}
++				if (method == u"presence.set"_q && error.isEmpty()) {
++					for (const auto widget : QApplication::topLevelWidgets()) {
++						const auto shell = dynamic_cast<IcqramShell*>(widget);
++						if (shell && shell != this && shell->_account == _account && (shell->_peerId.isEmpty() || shell->_peerId == u"profile"_q || shell->_peerId == u"settings"_q || shell->_peerId == u"presence"_q)) shell->_webview->eval("document.dispatchEvent(new Event('icqram-refresh-profile'));");
++					}
++				}
++				sendReply(id, std::move(result), std::move(error));
++			}));
++			return;
++		} else if (method == u"window.resize"_q
++			|| method == u"window.close"_q
++			|| method == u"window.minimize"_q
++			|| method == u"window.dragStart"_q
++			|| method == u"window.dragMove"_q
++			|| method == u"window.dragEnd"_q) {
++			if (method == u"window.resize"_q) {
++				const auto width = params.value(u"width"_q).toInt();
++				const auto height = params.value(u"height"_q).toInt();
++				if (_mediaId) {
++                    setFixedSize(640,520);
++                } else if (_peerId == u"now"_q) {
++					resize(std::clamp(width, 500, 1400), std::clamp(height, 400, 1100));
++				} else if (_peerId == u"directory"_q) {
++					resize(std::clamp(width, 456, 1000), std::clamp(height, 437, 900));
++				} else if (!_peerId.isEmpty()) {
++					resize(std::clamp(width, 476, 1200), std::clamp(height, 267, 900));
++				} else if (width >= 200 && width <= 900 && height >= 100 && height <= 1000) {
++					auto target = QSize(std::clamp(width, 236, 900), std::clamp(height, 300, 1000));
++					const auto contacts = params.value(u"surface"_q).toString() == u"contacts"_q;
++					const auto remember = contacts && params.value(u"remember"_q).toBool();
++					auto settings = QSettings(u"icqram"_q, u"icqram"_q);
++					const auto saved = settings.value(u"windows/contactsSize"_q).toSize();
++					if (saved.isValid() && ((contacts && !remember) || (!contacts && _account->sessionExists()))) target = saved.boundedTo(QSize(900, 1000)).expandedTo(QSize(236, 300));
++					resize(target);
++					if (remember) {
++						settings.setValue(u"windows/contactsSize"_q, size());
++						settings.sync();
++					}
++				}
++			} else if (method == u"window.close"_q) {
++				InvokeQueued(this, [=] { hide(); });
++			} else if (method == u"window.minimize"_q) {
++				showMinimized();
++			} else if (method == u"window.dragStart"_q) {
++				_dragOrigin = pos();
++				_dragPointer = QPoint(qRound(params.value(u"x"_q).toDouble()), qRound(params.value(u"y"_q).toDouble()));
++				_dragging = !windowHandle() || !windowHandle()->startSystemMove();
++				if (!_dragging) {
++					LOG(("icqram system window drag: moved=%1").arg(pos() != _dragOrigin));
++				}
++			} else if (method == u"window.dragMove"_q && _dragging) {
++				move(_dragOrigin + QPoint(qRound(params.value(u"x"_q).toDouble()), qRound(params.value(u"y"_q).toDouble())) - _dragPointer);
++			} else if (method == u"window.dragEnd"_q) {
++				if (_dragging) {
++					LOG(("icqram fallback window drag: moved=%1").arg(pos() != _dragOrigin));
++				}
++				_dragging = false;
++			}
++			reply.insert(u"result"_q, QJsonObject{ { u"ok"_q, true } });
++		} else {
++			reply.insert(u"error"_q, u"CONNECTION_UNAVAILABLE"_q);
++		}
++		_webview->eval("window.icqramReceive("
++			+ QJsonDocument(reply).toJson(QJsonDocument::Compact)
++			+ ");");
++	});
++	sizeValue() | rpl::on_next([=](QSize size) {
++		if (const auto widget = _webview->widget()) {
++			widget->setGeometry(QRect(QPoint(), size));
++		}
++	}, lifetime());
++	_webview->navigate(origin + (_peerId == u"now"_q ? u"now.html"_q : u"index.html"_q));
++}
++
++void IcqramShell::finishStartup() {
++	if (!_startupActive) return;
++	_startupActive = false;
++	_startupDeadline.cancel();
++#ifdef Q_OS_MAC
++	Platform::HideIcqramStartup();
++#endif
++	focus();
++}
++
++IcqramShell::~IcqramShell() {
++#ifdef Q_OS_MAC
++	if (_startupActive) Platform::HideIcqramStartup();
++#endif
++	if (_mediaId && _mediaApi) _mediaApi->cancelMedia(_mediaId);
++}
++
++void IcqramShell::sendReply(qint64 id, QJsonObject result, QString error) {
++	auto reply = QJsonObject{{u"version"_q, 1}, {u"id"_q, id}};
++	if (error.isEmpty()) reply.insert(u"result"_q, std::move(result));
++	else reply.insert(u"error"_q, std::move(error));
++	_webview->eval("window.icqramReceive(" + QJsonDocument(reply).toJson(QJsonDocument::Compact) + ");");
++}
++
++void IcqramShell::openAuxiliary(const QString &kind, QJsonObject data) {
++	if (!IsAuxiliary(kind) || _locked || Core::App().passcodeLocked()) return;
++	auto owner = this;
++	for (const auto widget : QApplication::topLevelWidgets()) {
++		const auto shell = dynamic_cast<IcqramShell*>(widget);
++		if (shell && shell->_peerId.isEmpty() && shell->_account == _account) { owner = shell; break; }
++	}
++	auto &panel = owner->_chats[kind];
++	if (!panel || kind == u"info"_q || (kind == u"presence"_q && !panel->isVisible())) panel = std::make_unique<IcqramShell>(nullptr, _account, _controller, kind, 0, nullptr, std::move(data));
++	panel->focus();
++}
++
++void IcqramShell::showAbout() {
++	openAuxiliary(u"about"_q);
++}
++
++bool IcqramShell::ShowMain(bool currentScreen) {
++	for (const auto widget : QApplication::topLevelWidgets()) {
++		const auto shell = dynamic_cast<IcqramShell*>(widget);
++		if (shell && shell->_peerId.isEmpty() && !shell->_locked && !Core::App().passcodeLocked()) {
++			if (currentScreen) {
++				if (const auto screen = QGuiApplication::screenAt(QCursor::pos())) {
++					const auto area = screen->availableGeometry();
++					if (!area.contains(shell->frameGeometry())) shell->move(area.center() - shell->rect().center());
++				}
++#ifdef Q_OS_MAC
++				Platform::MoveIcqramToCurrentSpace(shell);
++#endif
++			}
++			shell->focus();
++			return true;
++		}
++	}
++	return false;
++}
++
++bool IcqramShell::ShowSettings() {
++	if (!ShowMain()) return false;
++	for (const auto widget : QApplication::topLevelWidgets()) {
++		const auto shell = dynamic_cast<IcqramShell*>(widget);
++		if (shell && shell->_peerId.isEmpty() && !shell->_locked) {
++			shell->openAuxiliary(u"settings"_q);
++			return true;
++		}
++	}
++	return false;
++}
++
++bool IcqramShell::OpenNotificationChat(Main::Account *account, PeerId peer, MsgId topic) {
++	if (Core::App().passcodeLocked() || !account || !account->sessionExists()) return false;
++	for (const auto widget : QApplication::topLevelWidgets()) {
++		const auto shell = dynamic_cast<IcqramShell*>(widget);
++		if (!shell || !shell->_peerId.isEmpty() || shell->_account != account || shell->_locked) continue;
++		const auto key = Api::IcqramPeerKey(peer);
++		auto &chat = shell->_chats[key];
++		if (!chat) chat = std::make_unique<IcqramShell>(nullptr, account, shell->_controller, key, 0, nullptr,
++			QJsonObject{{u"topicId"_q, int(topic.bare)}});
++		chat->focus();
++		const auto data = QJsonDocument(QJsonObject{{u"topicId"_q, int(topic.bare)}}).toJson(QJsonDocument::Compact);
++		chat->_webview->eval("window.dispatchEvent(new CustomEvent('icqram-open-notification',{detail:" + data + "}));");
++		return true;
++	}
++	return false;
++}
++
++bool IcqramShell::IsReadingChat(const Main::Account *account, PeerId peer, MsgId topic) {
++	for (const auto widget : QApplication::topLevelWidgets()) {
++		const auto shell = dynamic_cast<IcqramShell*>(widget);
++		if (shell && shell->_account == account && shell->_chatApi && !shell->_mediaId
++			&& shell->_peerId == Api::IcqramPeerKey(peer) && !shell->_locked
++			&& shell->isVisible() && !shell->isMinimized() && shell->isActiveWindow()
++			&& shell->_chatApi->currentTopicId() == int(topic.bare)) return true;
++	}
++	return false;
++}
++
++QString IcqramShell::LocalPresence() {
++	for (const auto widget : QApplication::topLevelWidgets()) {
++		const auto shell = dynamic_cast<IcqramShell*>(widget);
++		if (shell && shell->_peerId.isEmpty()) return shell->_presenceCode;
++	}
++	return {};
++}
++
++void IcqramShell::SetLocalPresence(const QString &code) {
++	for (const auto widget : QApplication::topLevelWidgets()) {
++		const auto shell = dynamic_cast<IcqramShell*>(widget);
++		if (shell && shell->_peerId.isEmpty() && !shell->_locked && !Core::App().passcodeLocked() && shell->_account->sessionExists()) {
++			const auto data = QJsonDocument(QJsonObject{{u"code"_q, code}}).toJson(QJsonDocument::Compact);
++			shell->_webview->eval("document.dispatchEvent(new CustomEvent('icqram-tray-presence',{detail:" + data + "}));");
++			return;
++		}
++	}
++}
++
++void IcqramShell::HideAll() {
++	for (const auto widget : QApplication::topLevelWidgets()) {
++		if (const auto shell = dynamic_cast<IcqramShell*>(widget)) shell->hide();
++	}
++	UpdateDockVisibility();
++}
++
++void IcqramShell::UpdateDockVisibility() {
++#ifdef Q_OS_MAC
++	auto visible = false;
++	for (const auto widget : QApplication::topLevelWidgets()) {
++		if (const auto shell = dynamic_cast<IcqramShell*>(widget)) {
++			visible = visible || shell->isVisible() || shell->_locked;
++		}
++	}
++	Platform::SetIcqramDockVisible(visible);
++#endif
++}
++
++void IcqramShell::hideEvent(QHideEvent *event) {
++	RpWidget::hideEvent(event);
++	const auto commands = _chats.find(u"commands"_q);
++	if (commands != _chats.end()) commands->second->hide();
++	if (_mediaId && _webview) {
++		_webview->eval("window.dispatchEvent(new Event('icqram-viewer-stop'));");
++		if (_mediaApi) _mediaApi->cancelMedia(_mediaId);
++	}
++	InvokeQueued(this, [] { UpdateDockVisibility(); });
++}
++
++void IcqramShell::showEvent(QShowEvent *event) {
++	RpWidget::showEvent(event);
++	UpdateDockVisibility();
++}
++
++void IcqramShell::focus() {
++	if (_startupActive) return;
++#ifdef Q_OS_MAC
++	Platform::SetIcqramDockVisible(true);
++#endif
++	showNormal();
++	raise();
++	activateWindow();
++	_webview->focus();
++	if (_mediaId) _webview->eval("window.dispatchEvent(new Event('icqram-viewer-focus'));" );
++	if (_chatApi) _webview->eval("window.dispatchEvent(new Event('icqram-chat-changed'));");
++	if (_peerId == u"settings"_q) _webview->eval("window.dispatchEvent(new Event('icqram-settings-focus'));" );
++	if (_peerId == u"profile"_q) _webview->eval("document.dispatchEvent(new Event('icqram-refresh-profile'));");
++}
++
++void IcqramShell::setLocked(bool locked) {
++	if (_locked == locked) return;
++	if (locked) _restoreAfterLock = isVisible();
++	_locked = locked;
++	for (const auto &[id, chat] : _chats) chat->setLocked(locked);
++	if (_viewer) _viewer->setLocked(locked);
++	if (locked && _mediaId) {
++		_webview->eval("window.dispatchEvent(new Event('icqram-viewer-stop'));");
++		if (_mediaApi) _mediaApi->cancelMedia(_mediaId);
++	}
++	_webview->setInputBlocked(locked);
++	_webview->setVisible(!locked);
++	setVisible(!locked && (_peerId.isEmpty() || _restoreAfterLock));
++}
++
++} // namespace Window
+diff --git a/Telegram/SourceFiles/window/window_icqram_shell.h b/Telegram/SourceFiles/window/window_icqram_shell.h
+new file mode 100644
+index 0000000000..a4f97952fc
+--- /dev/null
++++ b/Telegram/SourceFiles/window/window_icqram_shell.h
+@@ -0,0 +1,74 @@
++#pragma once
++
++#include "ui/rp_widget.h"
++#include "base/timer.h"
++#include "mtproto/sender.h"
++#include <map>
++#include <QtCore/QJsonObject>
++#include <QtCore/QPointer>
++
++namespace Webview {
++class Window;
++} // namespace Webview
++namespace Main { class Account; }
++namespace Intro {
++class IcqramAuth;
++namespace details { struct Data; }
++}
++namespace Api { class IcqramAccount; class IcqramChat; }
++
++
++namespace Window {
++class Controller;
++
++class IcqramShell final : public Ui::RpWidget {
++public:
++	IcqramShell(QWidget *parent, not_null<Main::Account*> account, not_null<Controller*> controller, QString peerId = {}, int mediaId = 0, Api::IcqramChat *mediaApi = nullptr, QJsonObject panelData = {});
++	~IcqramShell();
++
++	static bool ShowMain(bool currentScreen = false);
++	static bool ShowSettings();
++	static bool OpenNotificationChat(Main::Account *account, PeerId peer, MsgId topic);
++	static bool IsReadingChat(const Main::Account *account, PeerId peer, MsgId topic);
++	static QString LocalPresence();
++	static void SetLocalPresence(const QString &code);
++	static void HideAll();
++	static void UpdateDockVisibility();
++	void focus();
++	void showAbout();
++	void setLocked(bool locked);
++
++protected:
++	void hideEvent(QHideEvent *event) override;
++	void showEvent(QShowEvent *event) override;
++
++private:
++	void sendReply(qint64 id, QJsonObject result, QString error = {});
++	void finishStartup();
++	void openAuxiliary(const QString &kind, QJsonObject data = {});
++	QPointer<IcqramShell> _commandOwner;
++	int _commandTopic = 0;
++	bool _startupActive = false;
++	base::Timer _startupDeadline;
++	const not_null<Main::Account*> _account;
++	const not_null<Controller*> _controller;
++	const QString _peerId;
++	std::map<QString, std::unique_ptr<IcqramShell>> _chats;
++	std::unique_ptr<Api::IcqramChat> _chatApi;
++	const int _mediaId;
++	Api::IcqramChat *const _mediaApi;
++	std::unique_ptr<IcqramShell> _viewer;
++	bool _restoreAfterLock = false;
++	QString _presenceCode = u"AV"_q;
++	std::unique_ptr<Webview::Window> _webview;
++	std::unique_ptr<Intro::details::Data> _authData;
++	std::unique_ptr<Intro::IcqramAuth> _auth;
++	std::unique_ptr<Api::IcqramAccount> _accountApi;
++	QPoint _dragOrigin;
++	QPoint _dragPointer;
++	bool _dragging = false;
++	bool _locked = false;
++
++};
++
++} // namespace Window
+diff --git a/Telegram/Telegram.plist b/Telegram/Telegram.plist
+index d156eda29c..c0b1f738e1 100644
+--- a/Telegram/Telegram.plist
++++ b/Telegram/Telegram.plist
+@@ -5,17 +5,17 @@
+ 	<key>CFBundleExecutable</key>
+ 	<string>@output_name@</string>
+ 	<key>CFBundleGetInfoString</key>
+-	<string>Telegram Desktop messaging app</string>
++	<string>IBQgram messaging app</string>
+ 	<key>CFBundleIconFile</key>
+-	<string>Icon.icns</string>
+-	<key>CFBundleIconName</key>
+-	<string>Icon.icns</string>
++	<string>icqram.icns</string>
+ 	<key>CFBundleIdentifier</key>
+ 	<string>@bundle_identifier_plist@</string>
+ 	<key>CFBundleInfoDictionaryVersion</key>
+ 	<string>6.0</string>
+ 	<key>CFBundleName</key>
+-	<string>@output_name@</string>
++	<string>IBQgram</string>
++	<key>CFBundleDisplayName</key>
++	<string>IBQgram</string>
+ 	<key>CFBundlePackageType</key>
+ 	<string>APPL</string>
+ 	<key>CFBundleShortVersionString</key>
+@@ -26,38 +26,6 @@
+ 	<array>
+ 		<string>MacOSX</string>
+ 	</array>
+-	<key>CFBundleURLTypes</key>
+-	<array>
+-		<dict>
+-			<key>CFBundleTypeRole</key>
+-			<string>Viewer</string>
+-			<key>CFBundleURLIconFile</key>
+-			<string>Icon.icns</string>
+-			<key>CFBundleURLName</key>
+-			<string>@bundle_identifier_plist@</string>
+-			<key>CFBundleURLSchemes</key>
+-			<array>
+-				<string>tg</string>
+-				<string>tonsite</string>
+-				<string>ton</string>
+-			</array>
+-		</dict>
+-	</array>
+-	<key>CFBundleDocumentTypes</key>
+-	<array>
+-		<dict>
+-			<key>CFBundleTypeName</key>
+-			<string>Any File</string>
+-			<key>CFBundleTypeRole</key>
+-			<string>Viewer</string>
+-			<key>LSHandlerRank</key>
+-			<string>Alternate</string>
+-			<key>LSItemContentTypes</key>
+-			<array>
+-				<string>public.data</string>
+-			</array>
+-		</dict>
+-	</array>
+ 	<key>CFBundleVersion</key>
+ 	<string>@desktop_app_version_string@</string>
+ 	<key>ITSAppUsesNonExemptEncryption</key>
+diff --git a/Telegram/cmake/icqram.cmake b/Telegram/cmake/icqram.cmake
+new file mode 100644
+index 0000000000..7ba24e85ec
+--- /dev/null
++++ b/Telegram/cmake/icqram.cmake
+@@ -0,0 +1,38 @@
++option(ICQRAM_SHELL "Use the shared icqram HTML shell." OFF)
++set(ICQRAM_UI_QRC "" CACHE FILEPATH "Generated resource collection for the shared UI.")
++set(ICQRAM_ICON_ICNS "" CACHE FILEPATH "Flower application icon.")
++if (ICQRAM_SHELL)
++    if (NOT EXISTS "${ICQRAM_UI_QRC}")
++        message(FATAL_ERROR "Generate ICQRAM_UI_QRC with the icqram root build script first.")
++    endif()
++    if (NOT EXISTS "${ICQRAM_ICON_ICNS}")
++        message(FATAL_ERROR "Generate ICQRAM_ICON_ICNS with the icqram root build script first.")
++    endif()
++    set_source_files_properties("${ICQRAM_ICON_ICNS}" PROPERTIES MACOSX_PACKAGE_LOCATION Resources)
++    target_sources(Telegram PRIVATE "${ICQRAM_ICON_ICNS}")
++    if (APPLE)
++        get_filename_component(icqram_ui_parent "${ICQRAM_UI_QRC}" DIRECTORY)
++        set(icqram_ui_dir "${icqram_ui_parent}/ui")
++        file(GLOB_RECURSE icqram_ui_files CONFIGURE_DEPENDS "${icqram_ui_dir}/*")
++        foreach(icqram_ui_file IN LISTS icqram_ui_files)
++            file(RELATIVE_PATH icqram_ui_relative "${icqram_ui_dir}" "${icqram_ui_file}")
++            get_filename_component(icqram_ui_folder "${icqram_ui_relative}" DIRECTORY)
++            set_source_files_properties("${icqram_ui_file}" PROPERTIES MACOSX_PACKAGE_LOCATION "Resources/ui/${icqram_ui_folder}")
++        endforeach()
++        target_sources(Telegram PRIVATE ${icqram_ui_files})
++    endif()
++    target_compile_definitions(Telegram PRIVATE ICQRAM_SHELL)
++    target_sources(Telegram PRIVATE
++        SourceFiles/window/window_icqram_shell.cpp
++        SourceFiles/window/window_icqram_shell.h
++        SourceFiles/window/notifications_icqram.cpp
++        SourceFiles/window/notifications_icqram.h
++        SourceFiles/intro/intro_icqram_auth.cpp
++        SourceFiles/intro/intro_icqram_auth.h
++        SourceFiles/api/api_icqram_account.cpp
++        SourceFiles/api/api_icqram_account.h
++        SourceFiles/api/api_icqram_chat.cpp
++        SourceFiles/api/api_icqram_chat.h
++        "${ICQRAM_UI_QRC}"
++    )
++endif()
+diff --git a/Telegram/cmake/icqram_apple_runtime.cmake b/Telegram/cmake/icqram_apple_runtime.cmake
+new file mode 100644
+index 0000000000..d2de0ae9f2
+--- /dev/null
++++ b/Telegram/cmake/icqram_apple_runtime.cmake
+@@ -0,0 +1,46 @@
++# Keep the icqram arm64 bundle free of Intel-only Swift back-deployment libraries.
++if (NOT DEFINED ICQRAM_EXECUTABLE OR NOT EXISTS "${ICQRAM_EXECUTABLE}")
++    message(FATAL_ERROR "An existing icqram executable is required.")
++endif()
++find_program(icqram_lipo lipo REQUIRED)
++find_program(icqram_otool otool REQUIRED)
++execute_process(COMMAND "${icqram_lipo}" -archs "${ICQRAM_EXECUTABLE}"
++    OUTPUT_VARIABLE icqram_archs OUTPUT_STRIP_TRAILING_WHITESPACE COMMAND_ERROR_IS_FATAL ANY)
++if (NOT icqram_archs STREQUAL "arm64")
++    return()
++endif()
++get_filename_component(icqram_bin_dir "${ICQRAM_EXECUTABLE}" DIRECTORY)
++set(icqram_frameworks "${icqram_bin_dir}/../Frameworks")
++file(GLOB icqram_libraries "${icqram_frameworks}/libswift*.dylib")
++set(icqram_arm_libraries "${ICQRAM_EXECUTABLE}")
++set(icqram_incompatible)
++foreach(icqram_library IN LISTS icqram_libraries)
++    execute_process(COMMAND "${icqram_lipo}" -archs "${icqram_library}"
++        OUTPUT_VARIABLE icqram_library_archs OUTPUT_STRIP_TRAILING_WHITESPACE COMMAND_ERROR_IS_FATAL ANY)
++    if (icqram_library_archs MATCHES "(^| )arm64( |$)")
++        if (NOT icqram_library_archs STREQUAL "arm64")
++            execute_process(COMMAND "${icqram_lipo}" "${icqram_library}" -thin arm64 -output "${icqram_library}.arm64"
++                COMMAND_ERROR_IS_FATAL ANY)
++            file(RENAME "${icqram_library}.arm64" "${icqram_library}")
++        endif()
++        list(APPEND icqram_arm_libraries "${icqram_library}")
++    else()
++        list(APPEND icqram_incompatible "${icqram_library}")
++    endif()
++endforeach()
++foreach(icqram_library IN LISTS icqram_incompatible)
++    get_filename_component(icqram_name "${icqram_library}" NAME)
++    if (NOT icqram_name STREQUAL "libswiftCore.dylib")
++        message(FATAL_ERROR "Swift runtime ${icqram_name} does not support arm64.")
++    endif()
++    foreach(icqram_consumer IN LISTS icqram_arm_libraries)
++        execute_process(COMMAND "${icqram_otool}" -L "${icqram_consumer}"
++            OUTPUT_VARIABLE icqram_dependencies COMMAND_ERROR_IS_FATAL ANY)
++        if (icqram_dependencies MATCHES "@(rpath|loader_path|executable_path)/[^\n]*libswiftCore[.]dylib"
++            OR icqram_dependencies MATCHES "Contents/Frameworks/libswiftCore[.]dylib")
++            message(FATAL_ERROR "An arm64 component still requires the bundled Intel-only libswiftCore.")
++        endif()
++    endforeach()
++    # arm64 uses the OS Swift core; this copy only serves the removed Intel slice.
++    file(REMOVE "${icqram_library}")
++endforeach()
+diff --git a/Telegram/cmake/telegram_apple_swift_runtime.cmake b/Telegram/cmake/telegram_apple_swift_runtime.cmake
+index 0a94b3ffcf..8dfd5c9752 100644
+--- a/Telegram/cmake/telegram_apple_swift_runtime.cmake
++++ b/Telegram/cmake/telegram_apple_swift_runtime.cmake
+@@ -55,4 +55,12 @@ function(telegram_add_apple_swift_runtime target_name)
+             --destination $<TARGET_FILE_DIR:${target_name}>/../Frameworks
+         VERBATIM
+     )
++    if (ICQRAM_SHELL)
++        add_custom_command(TARGET ${target_name} POST_BUILD
++            COMMAND "${CMAKE_COMMAND}"
++                "-DICQRAM_EXECUTABLE=$<TARGET_FILE:${target_name}>"
++                -P "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/icqram_apple_runtime.cmake"
++            VERBATIM
++        )
++    endif()
+ endfunction()
+diff --git a/Telegram/SourceFiles/window/notifications_icqram.cpp b/Telegram/SourceFiles/window/notifications_icqram.cpp
+new file mode 100644
+index 0000000000..02e2ee8b78
+--- /dev/null
++++ b/Telegram/SourceFiles/window/notifications_icqram.cpp
+@@ -0,0 +1,82 @@
++#include "window/notifications_icqram.h"
++
++#include "core/application.h"
++#include "core/core_settings.h"
++#include "data/data_channel.h"
++#include "history/history.h"
++#include "history/history_item.h"
++#include "main/main_session.h"
++#include "window/notifications_manager.h"
++#include "window/window_icqram_shell.h"
++
++#include <QtCore/QCoreApplication>
++#include <QtCore/QFile>
++#include <QtCore/QSettings>
++
++namespace Window::Notifications {
++
++QJsonObject IcqramPreferences() {
++	const auto &settings = Core::App().settings();
++	auto local = QSettings(u"icqram"_q, u"icqram"_q);
++	auto result = QJsonObject{
++		{ u"enabled"_q, settings.desktopNotify() },
++		{ u"sound"_q, settings.soundNotify() },
++		{ u"preview"_q, int(settings.notifyView()) },
++	};
++	for (const auto key : { u"private"_q, u"groups"_q, u"channels"_q, u"pauseInDnd"_q }) {
++		result.insert(key, local.value(u"notifications/"_q + key, true).toBool());
++	}
++	return result;
++}
++
++bool SaveIcqramPreferences(const QJsonObject &values) {
++	const auto current = IcqramPreferences();
++	for (auto i = values.begin(); i != values.end(); ++i) {
++		if (!current.contains(i.key())) return false;
++		if (i.key() == u"preview"_q) {
++			if (!i.value().isDouble() || i.value().toDouble() != i.value().toInt(-1)
++				|| i.value().toInt(-1) < 0 || i.value().toInt(-1) > 2) return false;
++		} else if (!i.value().isBool()) {
++			return false;
++		}
++	}
++	auto local = QSettings(u"icqram"_q, u"icqram"_q);
++	for (const auto key : { u"private"_q, u"groups"_q, u"channels"_q, u"pauseInDnd"_q }) {
++		if (values.contains(key)) local.setValue(u"notifications/"_q + key, values.value(key).toBool());
++	}
++	local.sync();
++	if (local.status() != QSettings::NoError) return false;
++	auto &settings = Core::App().settings();
++	if (values.contains(u"enabled"_q)) settings.setDesktopNotify(values.value(u"enabled"_q).toBool());
++	if (values.contains(u"sound"_q)) settings.setSoundNotify(values.value(u"sound"_q).toBool());
++	if (values.contains(u"preview"_q)) settings.setNotifyView(Core::Settings::NotifyView(values.value(u"preview"_q).toInt()));
++	settings.setNativeNotifications(true);
++	Core::App().saveSettingsDelayed();
++	Core::App().notifications().clearAll();
++	Core::App().notifications().notifySettingsChanged(ChangeType::ViewParams);
++	Core::App().notifications().notifySettingsChanged(ChangeType::DesktopEnabled);
++	return true;
++}
++
++bool IcqramAllowsNotification(not_null<HistoryItem*> item) {
++	const auto preferences = IcqramPreferences();
++	if (!preferences.value(u"enabled"_q).toBool()) return false;
++	const auto peer = item->history()->peer;
++	const auto channel = peer->asChannel();
++	const auto category = peer->isUser() ? u"private"_q
++		: (channel && channel->isBroadcast()) ? u"channels"_q : u"groups"_q;
++	if (!preferences.value(category).toBool()) return false;
++	const auto &session = item->history()->session();
++	const auto status = QSettings(u"icqram"_q, u"icqram"_q).value(
++		u"accounts/"_q + QString::number(session.userId().bare) + u"/presence"_q).toString();
++	if (preferences.value(u"pauseInDnd"_q).toBool() && status == u"DND"_q) return false;
++	return !IcqramShell::IsReadingChat(&session.account(), peer->id, item->topicRootId());
++}
++
++QString IcqramSoundPath() {
++	const auto path = QCoreApplication::applicationDirPath()
++		+ u"/../Resources/ui/sounds/icq-message-received-sfx.mp3"_q;
++	return QFile::exists(path) ? path : QString();
++}
++
++}
+diff --git a/Telegram/SourceFiles/window/notifications_icqram.h b/Telegram/SourceFiles/window/notifications_icqram.h
+new file mode 100644
+index 0000000000..c0c97f4e4e
+--- /dev/null
++++ b/Telegram/SourceFiles/window/notifications_icqram.h
+@@ -0,0 +1,13 @@
++#pragma once
++
++#include <QtCore/QJsonObject>
++
++class HistoryItem;
++namespace Window::Notifications {
++
++QJsonObject IcqramPreferences();
++bool SaveIcqramPreferences(const QJsonObject &values);
++bool IcqramAllowsNotification(not_null<HistoryItem*> item);
++QString IcqramSoundPath();
++
++}

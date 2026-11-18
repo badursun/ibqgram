@@ -1,0 +1,163 @@
+{
+  "name": "IBQgram",
+  "version": 4,
+  "palette": {
+    "sage": "#AFCB9D",
+    "accent": "#76CB2E",
+    "motionAccent": "#E44536",
+    "ink": "#062111",
+    "center": "#F4D366",
+    "paper": "#F8F5EA",
+    "dark": "#1C2520"
+  },
+  "assets": [
+    {
+      "path": "static/ibqgram-icon-light.svg",
+      "kind": "icon",
+      "theme": "light",
+      "state": "static"
+    },
+    {
+      "path": "animations/ibqgram-icon-light-connecting.svg",
+      "kind": "icon",
+      "theme": "light",
+      "state": "connecting"
+    },
+    {
+      "path": "animations/ibqgram-icon-light-message.svg",
+      "kind": "icon",
+      "theme": "light",
+      "state": "message"
+    },
+    {
+      "path": "static/ibqgram-icon-dark.svg",
+      "kind": "icon",
+      "theme": "dark",
+      "state": "static"
+    },
+    {
+      "path": "animations/ibqgram-icon-dark-connecting.svg",
+      "kind": "icon",
+      "theme": "dark",
+      "state": "connecting"
+    },
+    {
+      "path": "animations/ibqgram-icon-dark-message.svg",
+      "kind": "icon",
+      "theme": "dark",
+      "state": "message"
+    },
+    {
+      "path": "static/ibqgram-logo-light.svg",
+      "kind": "logo",
+      "theme": "light",
+      "state": "static"
+    },
+    {
+      "path": "animations/ibqgram-logo-light-connecting.svg",
+      "kind": "logo",
+      "theme": "light",
+      "state": "connecting"
+    },
+    {
+      "path": "animations/ibqgram-logo-light-message.svg",
+      "kind": "logo",
+      "theme": "light",
+      "state": "message"
+    },
+    {
+      "path": "static/ibqgram-logo-dark.svg",
+      "kind": "logo",
+      "theme": "dark",
+      "state": "static"
+    },
+    {
+      "path": "animations/ibqgram-logo-dark-connecting.svg",
+      "kind": "logo",
+      "theme": "dark",
+      "state": "connecting"
+    },
+    {
+      "path": "animations/ibqgram-logo-dark-message.svg",
+      "kind": "logo",
+      "theme": "dark",
+      "state": "message"
+    },
+    {
+      "path": "static/ibqgram-lockup-light.svg",
+      "kind": "lockup",
+      "theme": "light",
+      "state": "static"
+    },
+    {
+      "path": "animations/ibqgram-lockup-light-connecting.svg",
+      "kind": "lockup",
+      "theme": "light",
+      "state": "connecting"
+    },
+    {
+      "path": "animations/ibqgram-lockup-light-message.svg",
+      "kind": "lockup",
+      "theme": "light",
+      "state": "message"
+    },
+    {
+      "path": "static/ibqgram-lockup-dark.svg",
+      "kind": "lockup",
+      "theme": "dark",
+      "state": "static"
+    },
+    {
+      "path": "animations/ibqgram-lockup-dark-connecting.svg",
+      "kind": "lockup",
+      "theme": "dark",
+      "state": "connecting"
+    },
+    {
+      "path": "animations/ibqgram-lockup-dark-message.svg",
+      "kind": "lockup",
+      "theme": "dark",
+      "state": "message"
+    },
+    {
+      "path": "static/ibqgram-icon-light-small.svg",
+      "kind": "icon",
+      "theme": "light",
+      "state": "small"
+    },
+    {
+      "path": "static/ibqgram-icon-light-monochrome.svg",
+      "kind": "icon",
+      "theme": "light",
+      "state": "monochrome"
+    },
+    {
+      "path": "static/ibqgram-icon-dark-small.svg",
+      "kind": "icon",
+      "theme": "dark",
+      "state": "small"
+    },
+    {
+      "path": "static/ibqgram-icon-dark-monochrome.svg",
+      "kind": "icon",
+      "theme": "dark",
+      "state": "monochrome"
+    }
+  ],
+  "motion": {
+    "direction": "clockwise",
+    "petals": 5,
+    "start": "upper-right",
+    "connecting": {
+      "seconds": 1.5,
+      "repeat": "infinite"
+    },
+    "message": {
+      "seconds": 0.8,
+      "repeat": 2,
+      "totalSeconds": 1.6
+    },
+    "reducedMotion": "static upper-right accent"
+  },
+  "wordmark": "Outlined from the approved concept; no installed font or external image is required."
+}
